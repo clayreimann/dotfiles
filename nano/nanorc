@@ -1,0 +1,2 @@
+include "~/.nano/git.nanorc"
+include "~/.nano/sh.nanorc"

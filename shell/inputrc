@@ -1,0 +1,6 @@
+# Append "/" to all dirnames
+set mark-directories on
+set mark-symlinked-directories on
+
+# Shift is too hard
+set completion-ignore-case On

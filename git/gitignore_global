@@ -1,0 +1,6 @@
+*~
+.DS_Store
+test-output
+.idea
+.tern-project
+*.iml

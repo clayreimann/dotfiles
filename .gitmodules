@@ -1,0 +1,9 @@
+[submodule "dotbot"]
+	path = dotbot
+	url = https://github.com/anishathalye/dotbot
+[submodule "nano/nano"]
+	path = nano/nano
+	url = https://github.com/scopatz/nanorc
+[submodule "shell/bash-it"]
+	path = shell/bash-it
+	url = https://github.com/Bash-it/bash-it.git

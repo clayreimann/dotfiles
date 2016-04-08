@@ -1,0 +1,26 @@
+- clean: ['~']
+
+- link:
+    ~/.dotfiles: "" # links this folder to ~/.dotfiles/
+    ~/.local-only: local-only
+
+    ~/.bash-it: shell/bash-it
+    ~/.bash_profile: shell/bash_profile
+    ~/.inputrc: shell/inputrc
+    ~/.aliases: shell/aliases
+
+    ~/.gitconfig: git/gitconfig
+    ~/.gitignore_global: git/gitignore_global
+
+    ~/.nano: nano/nano
+    ~/.nanorc: nano/nanorc
+
+    ~/.ssh/config:
+        path: ssh/config
+        create: true
+
+    ~/.yo-rc-global.json: node/yo-rc-global.json
+
+- shell:
+  - ['git submodule update --init --recursive', 'Installing submodules']
+  - ['bash ~/dotfiles/shell/configure.sh', 'Configure bash-it']
