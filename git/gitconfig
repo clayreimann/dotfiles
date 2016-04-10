@@ -5,7 +5,8 @@
 [alias]
 	st = status -sb
 	co = commit
-	ca = commit --amend
+	ca = commit -a
+	cam = commit --amend
 	caa = commit -a --amend
 	save = commit -am "checkpoint"
 	force = push --force

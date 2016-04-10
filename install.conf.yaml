@@ -22,5 +22,5 @@
     ~/.yo-rc-global.json: node/yo-rc-global.json
 
 - shell:
-  - ['git submodule update --init --recursive', 'Installing submodules']
+  - ['git submodule foreach git pull origin master', 'Updating submodules']
   - ['bash ~/dotfiles/shell/configure.sh', 'Configure bash-it']
