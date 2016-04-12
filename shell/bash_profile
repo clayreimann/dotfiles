@@ -31,10 +31,10 @@ export SCM_CHECK=true
 # Load Bash It
 source $BASH_IT/bash_it.sh
 
-if [ -d "~/.local-only" ]; then
+if [ -d ~/.local-only ]; then
   source ~/.local-only/*.sh
 fi
 
-if [ -f "~/.aliases" ]; then
+if [ -f ~/.aliases ]; then
   source ~/.aliases
 fi

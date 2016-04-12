@@ -1,6 +1,7 @@
 *~
+.idea/
+.tern-project/
+test-output/
+
 .DS_Store
-test-output
-.idea
-.tern-project
 *.iml

@@ -7,7 +7,7 @@
     ~/.bash-it: shell/bash-it
     ~/.bash_profile: shell/bash_profile
     ~/.inputrc: shell/inputrc
-    ~/.aliases: shell/aliases
+    ~/.aliases: shell/aliases.sh
 
     ~/.gitconfig: git/gitconfig
     ~/.gitignore_global: git/gitignore_global

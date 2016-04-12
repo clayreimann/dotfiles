@@ -4,15 +4,19 @@
 
 [alias]
 	st = status -sb
+	cb = checkout -b
 	co = commit
 	ca = commit -a
 	cam = commit --amend
 	caa = commit -a --amend
-	save = commit -am "checkpoint"
+	save = commit -am 'checkpoint'
 	force = push --force
+	push = push --tags
+	undo = reset HEAD^
+	put = "!git push --tags -u origin `git status -sb --porcelain | sed -E 's/ |#//g'`"
 
 [core]
-	excludesfile = $HOME/.gitignore_global
+	excludesfile = ~/.gitignore_global
 	editor = nano
 
 [color]
