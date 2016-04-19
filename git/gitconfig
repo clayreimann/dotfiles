@@ -4,14 +4,14 @@
 
 [alias]
 	st = status -sb
-	cb = checkout -b
+	cb = "!f() { git checkout -b `echo \"$@\" | sed -E 's/ /-/g'`; }; f"
 	co = commit
 	ca = commit -a
 	cam = commit --amend
 	caa = commit -a --amend
 	save = commit -am 'checkpoint'
 	force = push --force
-	push = push --tags
+	push = push --follow-tags
 	undo = reset HEAD^
 	put = "!git push --tags -u origin `git status -sb --porcelain | sed -E 's/ |#//g'`"
 
