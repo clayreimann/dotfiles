@@ -7,8 +7,8 @@
 	cb = "!f() { git checkout -b `echo \"$@\" | sed -E 's/ /-/g'`; }; f"
 	co = commit
 	ca = commit -a
-	cam = commit --amend
-	caa = commit -a --amend
+	coam = commit --amend
+	caam = commit -a --amend
 	save = commit -am 'checkpoint'
 	force = push --force
 	force-push = push --force
