@@ -11,6 +11,8 @@
 	caa = commit -a --amend
 	save = commit -am 'checkpoint'
 	force = push --force
+	force-push = push --force
+	force-pull = pull --force
 	push = push --follow-tags
 	undo = reset HEAD^
 	put = "!git push --tags -u origin `git status -sb --porcelain | sed -E 's/ |#//g'`"
