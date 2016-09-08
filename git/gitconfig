@@ -3,19 +3,20 @@
 	email = clayreimann@gmail.com
 
 [alias]
-	st = status -sb
+	ca = commit -a
+	caam = commit -a --amend
 	cb = "!f() { git checkout -b `echo \"$@\" | sed -E 's/ /-/g'`; }; f"
 	co = commit
-	ca = commit -a
 	coam = commit --amend
-	caam = commit -a --amend
-	save = commit -am 'checkpoint'
 	force = push --force
-	force-push = push --force
 	force-pull = pull --force
+	force-push = push --force
+	master = checkout master
 	push = push --follow-tags
+	put = "!git stash -u && git push --tags -u origin `git status -sb --porcelain | sed -E 's/ |#//g'` && git stash pop"
+	save = commit -am 'checkpoint'
+	st = status -sb
 	undo = reset HEAD^
-	put = "!git push --tags -u origin `git status -sb --porcelain | sed -E 's/ |#//g'`"
 
 [core]
 	excludesfile = ~/.gitignore_global

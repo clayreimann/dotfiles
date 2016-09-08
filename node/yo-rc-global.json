@@ -3,5 +3,19 @@
     "promptValues": {
       "authorUrl": "http://clayreimann.me"
     }
+  },
+  "generator-node:1.10.2": {
+    "promptValues": {
+      "authorEmail": "clayreimann@yahoo-inc.com",
+      "authorUrl": ""
+    }
+  },
+  "generator-fluxible-bootstrap:1.0.0": {
+    "promptValues": {
+      "enableBower": false,
+      "author": "Clay Reimann",
+      "email": "clayreimann@yahoo-inc.com",
+      "gitCommit": true
+    }
   }
 }

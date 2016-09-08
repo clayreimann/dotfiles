@@ -38,3 +38,6 @@ fi
 if [ -f ~/.aliases ]; then
   source ~/.aliases
 fi
+
+export NVM_DIR="/Users/clayreimann/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"  # This loads nvm
