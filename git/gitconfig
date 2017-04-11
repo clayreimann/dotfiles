@@ -1,6 +1,6 @@
 [user]
 	name = Clay Reimann
-	email = clayreimann@gmail.com
+	email = clayreimann@yahoo-inc.com
 
 [alias]
 	ca = commit -a
@@ -8,10 +8,12 @@
 	cb = "!f() { git checkout -b `echo \"$@\" | sed -E 's/ /-/g'`; }; f"
 	co = commit
 	coam = commit --amend
+	diff-stash = stash show -p
 	force = push --force
 	force-pull = pull --force
 	force-push = push --force
-	master = checkout master
+	master = "!git checkout master && git pull"
+	pages = "!git checkout gh-pages && git pull"
 	push = push --follow-tags
 	put = "!git stash -u && git push --tags -u origin `git status -sb --porcelain | sed -E 's/ |#//g'` && git stash pop"
 	save = commit -am 'checkpoint'
@@ -24,6 +26,9 @@
 
 [color]
 	ui = auto
+
+[diff]
+	renames = copies
 
 [push]
 	default = simple

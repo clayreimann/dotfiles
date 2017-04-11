@@ -1,2 +1,2 @@
-Host *
-  UseRoaming no
+Host falcon
+  HostName qa3.flurry.corp.gq1.yahoo.com
