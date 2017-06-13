@@ -20,6 +20,8 @@
         create: true
 
     ~/.yo-rc-global.json: node/yo-rc-global.json
+    
+    ~/.config/karabiner/karabiner.json: karabiner.json
 
 - shell:
   - ['git submodule foreach git pull origin master', 'Updating submodules']

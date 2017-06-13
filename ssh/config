@@ -1,2 +1,5 @@
 Host falcon
   HostName qa3.flurry.corp.gq1.yahoo.com
+
+Host ngdp
+  HostName whichevernever.corp.ne1.yahoo.com
