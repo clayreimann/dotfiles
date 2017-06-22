@@ -15,7 +15,9 @@ export SCM_CHECK=true
 source $BASH_IT/bash_it.sh
 
 if [ -d ~/.local-only ]; then
-  source ~/.local-only/*.sh
+  for f in ~/.local-only/*.sh; do
+    source $f
+  done
 fi
 
 if [ -f ~/.aliases ]; then
