@@ -3,6 +3,7 @@
 - link:
     ~/.dotfiles: "" # links this folder to ~/.dotfiles/
     ~/.local-only: local-only
+    ~/.config/bash-it: shell/bash-it-custom
 
     ~/.bash-it: shell/bash-it
     ~/.bash_profile: shell/bash_profile

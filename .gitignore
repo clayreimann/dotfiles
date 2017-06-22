@@ -1,2 +1,2 @@
 local-only/*
-!local-only/.gitkeep
+!local-only/example.sh
