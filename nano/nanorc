@@ -1,2 +1,6 @@
 include "~/.nano/git.nanorc"
 include "~/.nano/sh.nanorc"
+include "~/.nano/js.nanorc"
+include "~/.nano/nginx.nanorc"
+include "~/.nano/python.nanorc"
+include "~/.nano/ruby.nanorc"
