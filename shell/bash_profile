@@ -1,7 +1,4 @@
 export BASH_IT="$HOME/.bash-it"
-
-# Lock and Load a custom theme file
-# location /.bash_it/themes/
 export CUSTOM_THEME_DIR="$HOME/.config/bash-it"
 export BASH_IT_THEME='iterate-custom'
 

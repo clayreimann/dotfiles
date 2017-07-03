@@ -1,5 +1,8 @@
+- defaults:
+    link:
+      create: true
+      relink: true
 - clean: ['~']
-
 - link:
     ~/.dotfiles: "" # links this folder to ~/.dotfiles/
     ~/.local-only: local-only
@@ -21,7 +24,7 @@
         create: true
 
     ~/.yo-rc-global.json: node/yo-rc-global.json
-    
+
     ~/.config/karabiner/karabiner.json: karabiner.json
 
 - shell:
