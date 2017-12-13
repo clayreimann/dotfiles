@@ -7,6 +7,9 @@
     "profiles": [
         {
             "complex_modifications": {
+                "parameters": {
+                    "basic.to_if_alone_timeout_milliseconds": 1000
+                },
                 "rules": [
                     {
                         "manipulators": [
@@ -34,7 +37,20 @@
                     }
                 ]
             },
-            "devices": [],
+            "devices": [
+                {
+                    "disable_built_in_keyboard_if_exists": false,
+                    "fn_function_keys": {},
+                    "identifiers": {
+                        "is_keyboard": true,
+                        "is_pointing_device": false,
+                        "product_id": 617,
+                        "vendor_id": 1241
+                    },
+                    "ignore": false,
+                    "simple_modifications": {}
+                }
+            ],
             "fn_function_keys": {
                 "f1": "vk_consumer_brightness_down",
                 "f10": "mute",
@@ -46,12 +62,14 @@
                 "f5": "vk_consumer_illumination_down",
                 "f6": "vk_consumer_illumination_up",
                 "f7": "vk_consumer_previous",
-                "f8": "vk_consumer_play",
+                "f8": "play_or_pause",
                 "f9": "vk_consumer_next"
             },
             "name": "Clay's Profile",
             "selected": true,
-            "simple_modifications": {},
+            "simple_modifications": {
+                "application": "fn"
+            },
             "virtual_hid_keyboard": {
                 "caps_lock_delay_milliseconds": 0,
                 "keyboard_type": "ansi"
