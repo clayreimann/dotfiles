@@ -28,5 +28,7 @@
     ~/.config/karabiner/karabiner.json: karabiner.json
 
 - shell:
-  - ['git submodule foreach git pull origin master', 'Updating submodules']
+  - ['git submodule init', 'Initializing submodules']
+  - ['git submodule update', 'Updating submodules 1/2']
+  - ['git submodule foreach git pull origin master', 'Updating submodules 2/2']
   - ['bash ~/dotfiles/shell/configure.sh', 'Configure bash-it']
