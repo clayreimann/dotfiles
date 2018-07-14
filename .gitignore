@@ -1,2 +1,3 @@
 local-only/*
 !local-only/example.sh
+shell/bash-it/enabled/

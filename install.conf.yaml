@@ -13,6 +13,10 @@
     ~/.inputrc: shell/inputrc
     ~/.aliases: shell/aliases.sh
 
+    ~/.tmux.conf: shell/tmux.conf
+    ~/.config/powerline/config.json: shell/powerline.json
+    ~/.config/powerline/themes/tmux/default.json: shell/powerline.tmux.json
+
     ~/.gitconfig: git/gitconfig
     ~/.gitignore_global: git/gitignore_global
 

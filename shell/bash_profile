@@ -8,6 +8,10 @@ unset MAILCHECK
 # Set this to false to turn off version control status checking within the prompt for all themes
 export SCM_CHECK=true
 
+if [ -d "$HOME/Library/Python/3.6/bin" ]; then
+    PATH="$HOME/Library/Python/3.6/bin:$PATH"
+fi
+
 # Load Bash It
 source $BASH_IT/bash_it.sh
 

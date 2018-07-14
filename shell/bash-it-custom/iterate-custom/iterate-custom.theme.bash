@@ -23,8 +23,8 @@ function prompt_command() {
     fi
 
     local wrap_char=""
-    [[ $COLUMNS && ${#new_PS1} > $(($COLUMNS/1)) ]] && wrap_char="\n"
-    PS1="${new_PS1}${wrap_char}${blue}\h ${green}→${reset_color} "
+    [[ $COLUMNS && $((${#new_PS1} > $COLUMNS/1 )) != 0 ]] && wrap_char="\n"
+    PS1="${new_PS1}${wrap_char}${green}→${reset_color} "
 }
 
 safe_append_prompt_command prompt_command

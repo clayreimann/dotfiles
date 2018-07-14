@@ -1,0 +1,14 @@
+{
+  "segments": {
+    "left": [],
+    "right": [
+      {
+        "function": "powerline.segments.common.time.date",
+        "args": {
+          "format": "%H:%M",
+          "istime": true
+        }
+      }
+    ]
+  }
+}

@@ -1,6 +1,6 @@
 [user]
-	name = Clay Reimann
-	email = clayreimann@yahoo-inc.com
+	name = Clay Jensen-Reimann
+	email = clayreimann@oath.com
 
 [alias]
 	ca = commit -a
@@ -12,13 +12,16 @@
 	force = push --force
 	force-pull = pull --force
 	force-push = push --force
+  force-update = push --force --no-verify
 	master = "!git checkout master && git pull"
 	pages = "!git checkout gh-pages && git pull"
 	push = push --follow-tags
 	put = "!git stash -u && git push --tags -u origin `git status -sb --porcelain | sed -E 's/ |#//g'` && git stash pop"
+  put-fork = "!git stash -u && git push --tags -u clayreimann `git status -sb --porcelain | sed -E 's/ |#//g'` && git stash pop"
 	save = commit -am 'checkpoint'
 	st = status -sb
 	undo = reset HEAD^
+  update-fork = "!git pull origin master && git push clayreimann master --no-verify"
 
 [core]
 	excludesfile = ~/.gitignore_global
