@@ -25,7 +25,7 @@
   update-fork = "!git pull origin master && git push clayreimann master --no-verify"
 
 [core]
-	excludesfile = /Users/clayreimann/.gitignore_global
+	excludesfile = ~/.gitignore_global
 	editor = nano
 
 [color]

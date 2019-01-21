@@ -29,7 +29,9 @@
 
     ~/.yo-rc-global.json: node/yo-rc-global.json
 
-    ~/.config/karabiner/karabiner.json: karabiner.json
+    ~/.config/karabiner/karabiner.json:
+      force: true
+      path: karabiner.json
 
 - shell:
   - ['git submodule init', 'Initializing submodules']
