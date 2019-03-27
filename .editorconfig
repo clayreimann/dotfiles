@@ -11,5 +11,8 @@ insert_final_newline = true
 [*.md]
 trim_trailing_whitespace = false
 
+[iterate-custom.theme.bash]
+indent_size = 4
+
 [karabiner.json]
 indent_size = 4

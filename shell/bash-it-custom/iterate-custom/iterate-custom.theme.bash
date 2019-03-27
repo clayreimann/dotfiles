@@ -11,15 +11,22 @@ function git_prompt_info {
   echo -e "$SCM_PREFIX$SCM_BRANCH$SCM_STATE$SCM_GIT_AHEAD$SCM_GIT_BEHIND$SCM_GIT_STASH$SCM_SUFFIX"
 }
 
+ALWAYS_PROMPT=""
+FORCE_PROMPT=""
 LAST_PROMPT=""
 function prompt_command() {
     local new_PS1="${bold_cyan}$(scm_char) ${green}\w $(scm_prompt_info)"
-    local new_prompt=$(PS1="$new_PS1" "$BASH" --norc -i </dev/null 2>&1 | sed -n '${s/^\(.*\)exit$/\1/p;}')
 
-    if [ "$LAST_PROMPT" = "$new_prompt" ]; then
-        new_PS1=""
+    if [ "$FORCE_PROMPT" = "" ] && [ "$ALWAYS_PROMPT" = "" ]; then
+        FORCE_PROMPT=""
+        local new_prompt=$(PS1="$new_PS1" "$BASH" --norc -i </dev/null 2>&1 | sed -n '${s/^\(.*\)exit$/\1/p;}')
+        if [ "$LAST_PROMPT" = "$new_prompt" ]; then
+            new_PS1=""
+        else
+            LAST_PROMPT="$new_prompt"
+        fi
     else
-        LAST_PROMPT="$new_prompt"
+        FORCE_PROMPT=""
     fi
 
     local wrap_char=""
