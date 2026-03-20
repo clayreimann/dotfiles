@@ -1,0 +1,11 @@
+Host *
+  AddKeysToAgent yes
+  UseKeychain yes
+  IdentityFile ~/.ssh/id_ed25519
+  IdentityAgent "~/.1password/agent.sock"
+
+Host pm02.4406.madtown.cloud
+  IdentityFile ~/.ssh/pm02_ided
+
+Host github.com
+  IdentityAgent "~/.1password/agent.sock"

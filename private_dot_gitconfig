@@ -1,0 +1,22 @@
+[filter "lfs"]
+	process = git-lfs filter-process
+	required = true
+	clean = git-lfs clean -- %f
+	smudge = git-lfs smudge -- %f
+[user]
+	name = Clay Jensen-Reimann
+	email = clayreimann@gmail.com
+	signingkey = key::ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJPn+hLDA7eHS1Ef6qjVQycAoAldvPgK7nIpa/bArJOv Github_SSH_Key
+[init]
+	defaultBranch = main
+[pull]
+	ff = only
+[push]
+	followTags = true
+[gpg]
+	format = ssh
+[gpg "ssh"]
+	program = /usr/bin/ssh-keygen
+	allowedSignersFile = /Users/clay/.ssh/allowed_signers
+[commit]
+	gpgsign = true

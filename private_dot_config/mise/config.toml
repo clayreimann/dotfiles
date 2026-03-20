@@ -1,0 +1,7 @@
+[tools]
+java = "8"        # replaces SDKMAN — use "21" for modern Java
+node = "lts"      # replaces nvm default
+
+[settings]
+# Automatically trust .mise.toml files in projects
+trusted_config_paths = ["~"]
