@@ -28,3 +28,8 @@ alias ksss='kubectl scale statefulset'
 alias ls='eza --icons'
 alias ll='eza -la --icons'
 alias lt='eza --tree --icons'
+
+# System / nano
+alias nano='nano --tabstospaces --tabsize=2'
+alias hosts='sudo nano /etc/hosts'
+alias show-ssh='ps -ef | grep ssh | grep -v grep'
