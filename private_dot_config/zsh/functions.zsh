@@ -27,12 +27,32 @@ kexec() {
 alias switch_java='echo "Use: mise use java@<version>"'
 
 # Agent commit signing wrappers
-# Sets GIT_CONFIG_GLOBAL to agent-specific config so Claude/Codex
-# use the local signing key instead of 1Password
+# Restore the default machine-local Git identity inherited by non-interactive processes.
 claude-agent-sign() {
-  GIT_CONFIG_GLOBAL="$HOME/.gitconfig-agent" claude "$@"
+  GIT_CONFIG_GLOBAL="$HOME/.gitconfig" claude "$@"
 }
 
 codex-agent-sign() {
-  GIT_CONFIG_GLOBAL="$HOME/.gitconfig-agent" codex "$@"
+  GIT_CONFIG_GLOBAL="$HOME/.gitconfig" codex "$@"
+}
+
+# Launch desktop agent apps with the non-interactive Git signing config.
+# Quit an already-running app first: environment variables are fixed at launch.
+_agent-app-sign() {
+  local app_name="$1"
+
+  if pgrep -x "$app_name" >/dev/null; then
+    echo "$app_name is already running. Quit it, then run this command again." >&2
+    return 1
+  fi
+
+  open -a "$app_name" --env "GIT_CONFIG_GLOBAL=$HOME/.gitconfig"
+}
+
+chatgpt-app-agent-sign() {
+  _agent-app-sign "ChatGPT"
+}
+
+claude-app-agent-sign() {
+  _agent-app-sign "Claude"
 }
