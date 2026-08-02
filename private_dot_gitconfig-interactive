@@ -1,0 +1,5 @@
+[include]
+	path = ~/.gitconfig
+
+[user]
+	signingkey = key::ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJPn+hLDA7eHS1Ef6qjVQycAoAldvPgK7nIpa/bArJOv Github_SSH_Key
