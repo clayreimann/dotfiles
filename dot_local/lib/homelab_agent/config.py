@@ -13,6 +13,16 @@ from .models import AgentConfig, Bastion, ManagedTarget, Repository, SshIdentity
 DEFAULT_CONFIG_PATH = Path(
     "/Users/clay/Code/homelab/infra/config/mac-agent/credential-map.json"
 )
+_APPROVED_VAULT_NAME = "Homelab Secrets"
+_APPROVED_FORGEJO = {
+    "host": "git.4406.madtown.cloud",
+    "port": 2222,
+    "user": "git",
+    "credential_item_id": "yznfzgoql7jl4oa6spa7vm3644",
+    "private_field": "private_key",
+    "expected_fingerprint": "SHA256:hK4mZs4YQvDEf1zgeAOKtER0+eIdPJsDxRzPHlpXpjA",
+    "known_host": "[git.4406.madtown.cloud]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGyB56wKbde2dOT+puZOfjpWqTNx3sIDkEjoN1wvUTyT",
+}
 _FORBIDDEN_SECRET_KEYS = frozenset({"token", "password", "passphrase", "private_key"})
 _DOCUMENT_KEYS = frozenset(
     {
@@ -116,6 +126,12 @@ def _identity(value: object, path: str) -> SshIdentity:
     )
 
 
+def _validate_forgejo_pins(identity: SshIdentity) -> None:
+    for field, expected in _APPROVED_FORGEJO.items():
+        if getattr(identity, field) != expected:
+            raise ConfigError(f"forgejo.{field} must match the approved value")
+
+
 def _target(value: object, path: str) -> ManagedTarget:
     fields = _object(value, path, _TARGET_KEYS)
     route = _string(fields["route"], f"{path}.route")
@@ -206,10 +222,15 @@ def load_config(path: Path | None = None) -> AgentConfig:
         "keychain",
         frozenset({"connect_service", "bastion_service"}),
     )
+    vault_name = _string(vault["name"], "vault.name")
+    if vault_name != _APPROVED_VAULT_NAME:
+        raise ConfigError("vault.name must match the approved value")
+
     forgejo = _identity(fields["forgejo"], "forgejo")
+    _validate_forgejo_pins(forgejo)
 
     return AgentConfig(
-        vault_name=_string(vault["name"], "vault.name"),
+        vault_name=vault_name,
         direct_connect_url=_string(connect["direct_url"], "connect.direct_url"),
         tunnel_connect_url=_string(connect["tunnel_url"], "connect.tunnel_url"),
         connect_keychain_service=_string(

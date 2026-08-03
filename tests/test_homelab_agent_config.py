@@ -36,7 +36,7 @@ def valid_document() -> dict[str, object]:
             "credential_item_id": "yznfzgoql7jl4oa6spa7vm3644",
             "private_field": "private_key",
             "expected_fingerprint": "SHA256:hK4mZs4YQvDEf1zgeAOKtER0+eIdPJsDxRzPHlpXpjA",
-            "known_host": "[git.4406.madtown.cloud]:2222 ssh-ed25519 AAAA",
+            "known_host": "[git.4406.madtown.cloud]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGyB56wKbde2dOT+puZOfjpWqTNx3sIDkEjoN1wvUTyT",
         },
         "bastion": None,
         "targets": [
@@ -95,6 +95,36 @@ class LoadConfigTests(unittest.TestCase):
             config = load_config()
 
         self.assertEqual("Homelab Secrets", config.vault_name)
+
+    def test_load_config_rejects_unapproved_vault_name(self) -> None:
+        document = valid_document()
+        document["vault"]["name"] = "Other vault"  # type: ignore[index]
+
+        with self.assertRaisesRegex(
+            ConfigError, "vault.name must match the approved value"
+        ):
+            load_config(self.write_config(document))
+
+    def test_load_config_rejects_unapproved_forgejo_pins(self) -> None:
+        cases = {
+            "host": "other.example",
+            "port": 2200,
+            "user": "other-git",
+            "credential_item_id": "aaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "private_field": "ssh_key",
+            "expected_fingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "known_host": "[git.4406.madtown.cloud]:2222 ssh-ed25519 AAAA",
+        }
+
+        for field, replacement in cases.items():
+            with self.subTest(field=field):
+                document = valid_document()
+                document["forgejo"][field] = replacement  # type: ignore[index]
+
+                with self.assertRaisesRegex(
+                    ConfigError, f"forgejo.{field} must match the approved value"
+                ):
+                    load_config(self.write_config(document))
 
     def test_load_config_rejects_unknown_version(self) -> None:
         document = valid_document()
