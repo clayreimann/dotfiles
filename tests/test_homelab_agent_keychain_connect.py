@@ -177,6 +177,19 @@ class KeychainTests(unittest.TestCase):
 
 
 class ConnectClientTests(unittest.TestCase):
+    def test_connect_rejects_an_unapproved_vault_name_before_http(self) -> None:
+        fake_http = FakeHttp([])
+
+        with self.assertRaisesRegex(AgentError, "configured vault name is not approved"):
+            ConnectClient(
+                "http://127.0.0.1:18080",
+                Secret(TOKEN),
+                fake_http,
+                vault_name="Other vault",
+            )
+
+        self.assertEqual([], fake_http.requests)
+
     def test_health_uses_bearer_header_and_never_puts_token_in_url(self) -> None:
         fake_http = FakeHttp([{}])
         client = ConnectClient("http://127.0.0.1:18080", Secret(TOKEN), fake_http)

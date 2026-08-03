@@ -33,6 +33,8 @@ class ConnectClient:
         transport: HttpTransport | None = None,
         vault_name: str = _DEFAULT_VAULT_NAME,
     ) -> None:
+        if vault_name != _DEFAULT_VAULT_NAME:
+            raise AgentError("configured vault name is not approved")
         self._base_url = base_url.rstrip("/")
         self._token = token
         self._transport = transport or UrllibTransport()
