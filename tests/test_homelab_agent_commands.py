@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dot_local" / "lib"
 from homelab_agent.op_command import UsageError, run_op, validate_op_argv
 from homelab_agent.process import AgentError, Runner, Secret
 from homelab_agent.models import Repository
-from homelab_agent.doctor import CheckResult, enroll_keychain, run_doctor
+from homelab_agent.doctor import CheckResult, _inspect_repository, enroll_keychain, run_doctor
 
 
 TOKEN = "token-value"
@@ -773,7 +773,7 @@ class DoctorAndEnrollmentTests(unittest.TestCase):
             route_factory=lambda **_kwargs: Route(),
             connect_factory=lambda *_args, **_kwargs: Client(),
             credential_validator=lambda *_args, **_kwargs: False,
-            host_trust_checker=lambda _identity: False,
+            host_trust_probe=lambda _identity: False,
             forgejo_probe=lambda *_args, **_kwargs: 255,
         )
 
@@ -782,6 +782,54 @@ class DoctorAndEnrollmentTests(unittest.TestCase):
         self.assertEqual("FAIL", observed[("host-trust", "Forgejo host key")])
         self.assertEqual("FAIL", observed[("server-authorization", "Forgejo authentication")])
         self.assertNotIn("private-key-fixture", " ".join(result.detail for result in results))
+
+    def test_live_doctor_rejects_a_well_formed_but_wrong_presented_host_key_before_authentication(self) -> None:
+        class Route:
+            @contextmanager
+            def open(self, _config: object):
+                yield "http://connect.example:8080"
+
+        class Client:
+            def health(self) -> None:
+                return None
+
+        probe_calls: list[object] = []
+        results = run_doctor(
+            live=True,
+            load=lambda: self.config,
+            executable_exists=lambda _path: True,
+            python_version=lambda: "3.12.7",
+            keychain_factory=lambda: self.keychain,
+            route_factory=lambda **_kwargs: Route(),
+            connect_factory=lambda *_args, **_kwargs: Client(),
+            credential_validator=lambda *_args, **_kwargs: True,
+            host_trust_probe=lambda _identity: False,
+            forgejo_probe=lambda *_args, **_kwargs: probe_calls.append("auth") or 1,
+        )
+
+        host_check = next(result for result in results if result.category == "host-trust")
+        authorization = next(result for result in results if result.category == "server-authorization")
+        self.assertEqual("FAIL", host_check.status)
+        self.assertEqual("FAIL", authorization.status)
+        self.assertEqual([], probe_calls)
+
+    def test_presented_host_key_probe_compares_exact_pinned_public_line(self) -> None:
+        from homelab_agent import doctor
+
+        wrong_line = "[git.example]:2222 ssh-ed25519 AAAADifferent"
+        with patch.object(
+            doctor.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(("ssh-keyscan",), 0, stdout=wrong_line + "\n", stderr=""),
+        ) as scan:
+            self.assertFalse(doctor._presented_host_key_matches(self.config.forgejo))
+
+        argv = scan.call_args.args[0]
+        self.assertEqual(
+            ("/usr/bin/ssh-keyscan", "-T", "10", "-t", "ed25519", "-p", "2222", "git.example"),
+            argv,
+        )
+        self.assertTrue(scan.call_args.kwargs["capture_output"])
 
     def test_live_doctor_reports_clean_configured_clone_wiring_without_mutating_or_fetching(self) -> None:
         repository = Repository(
@@ -811,7 +859,7 @@ class DoctorAndEnrollmentTests(unittest.TestCase):
             route_factory=lambda **_kwargs: Route(),
             connect_factory=lambda *_args, **_kwargs: Client(),
             credential_validator=lambda *_args, **_kwargs: True,
-            host_trust_checker=lambda _identity: True,
+            host_trust_probe=lambda _identity: True,
             forgejo_probe=lambda *_args, **_kwargs: 1,
             repository_inspector=lambda configured: inspected.append(configured) or True,
         )
@@ -872,6 +920,85 @@ class DoctorAndEnrollmentTests(unittest.TestCase):
                 chmod=lambda _path, _mode: None,
                 empty_passphrase_probe=lambda _path: 0,
             )
+
+    def test_enrollment_filesystem_errors_are_redacted_and_cli_returns_one(self) -> None:
+        with self.assertRaisesRegex(AgentError, "permissions"):
+            enroll_keychain(
+                "bastion-service",
+                load=lambda: self.config,
+                keychain_factory=lambda: self.keychain,
+                key_path=Path("/Users/clay/.ssh/homelab_bastion_bootstrap"),
+                path_stat=lambda _path: SimpleNamespace(st_mode=0o100600),
+                chmod=lambda _path, _mode: (_ for _ in ()).throw(OSError("private-path")),
+            )
+
+        from homelab_agent import cli
+
+        stderr = io.StringIO()
+        rc = cli.main(
+            ["enroll", "bastion-passphrase"],
+            enroll_runner=lambda _service: (_ for _ in ()).throw(
+                AgentError("bastion key permissions could not be set")
+            ),
+            error_output=stderr,
+        )
+        self.assertEqual(1, rc)
+        self.assertIn("homelab-agent:", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_enrollment_path_and_empty_probe_oserrors_are_agent_errors(self) -> None:
+        common = {
+            "load": lambda: self.config,
+            "keychain_factory": lambda: self.keychain,
+            "key_path": Path("/Users/clay/.ssh/homelab_bastion_bootstrap"),
+        }
+        with self.assertRaisesRegex(AgentError, "file is unavailable"):
+            enroll_keychain(
+                "bastion-service",
+                **common,
+                path_stat=lambda _path: (_ for _ in ()).throw(OSError("private-path")),
+            )
+        with self.assertRaisesRegex(AgentError, "validation could not be completed"):
+            enroll_keychain(
+                "bastion-service",
+                **common,
+                path_stat=lambda _path: SimpleNamespace(st_mode=0o100600),
+                chmod=lambda _path, _mode: None,
+                empty_passphrase_probe=lambda _path: (_ for _ in ()).throw(OSError("private-path")),
+            )
+
+    def test_repository_inspection_scrubs_inherited_git_controls(self) -> None:
+        repository = Repository(
+            "infra", "ssh://git@git.example:2222/homelab/infra.git", Path("/work/infra")
+        )
+        inherited = {
+            "GIT_DIR": "/tmp/redirected-git-dir",
+            "GIT_WORK_TREE": "/tmp/redirected-worktree",
+            "GIT_SSH_COMMAND": "ssh unapproved",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.sshCommand",
+            "GIT_CONFIG_VALUE_0": "ssh unapproved",
+        }
+
+        class SequencedProcess:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+                self.outputs = [repository.remote + "\n", "/Users/clay/.local/bin/homelab-forgejo-ssh\n"]
+
+            def __call__(self, argv: tuple[str, ...], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+                self.calls.append({"argv": argv, **kwargs})
+                return subprocess.CompletedProcess(argv, 0, stdout=self.outputs.pop(0), stderr="")
+
+        executor = SequencedProcess()
+        with patch.dict(os.environ, inherited, clear=False), patch.object(
+            Path, "exists", return_value=True
+        ), patch.object(Path, "is_dir", return_value=True):
+            self.assertTrue(_inspect_repository(repository, runner=Runner(executor)))
+            self.assertEqual(inherited, {name: os.environ[name] for name in inherited})
+
+        for call in executor.calls:
+            for name in inherited:
+                self.assertNotIn(name, call["env"])
 
 
 if __name__ == "__main__":

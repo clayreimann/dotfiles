@@ -1,7 +1,6 @@
 """Public diagnostics and deliberately narrow local-secret enrollment."""
 from __future__ import annotations
 
-import base64
 import os
 import stat
 import subprocess
@@ -77,19 +76,34 @@ def _tool_checks(
     return results
 
 
-def _host_trust_matches(identity: Any) -> bool:
-    """Validate public known-host syntax before a strict SSH probe validates it live."""
-    expected_host = (
-        identity.host if identity.port == 22 else f"[{identity.host}]:{identity.port}"
-    )
-    parts = identity.known_host.split()
-    if len(parts) != 3 or parts[0] != expected_host or parts[1] != "ssh-ed25519":
-        return False
+def _presented_host_key_matches(identity: Any) -> bool:
+    """Compare the real, public Forgejo presentation with the exact pinned line.
+
+    ``ssh-keyscan`` output is captured and never shown to the caller.  A network
+    error, a missing key, a different key, or additional key material are all a
+    simple ``False`` host-trust result; no authentication is attempted afterward.
+    """
     try:
-        base64.b64decode(parts[2].encode("ascii"), validate=True)
-    except (UnicodeEncodeError, ValueError):
+        completed = subprocess.run(
+            (
+                "/usr/bin/ssh-keyscan",
+                "-T",
+                "10",
+                "-t",
+                "ed25519",
+                "-p",
+                str(identity.port),
+                identity.host,
+            ),
+            stdin=subprocess.DEVNULL,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
         return False
-    return True
+    presented = [line for line in completed.stdout.splitlines() if line.strip()]
+    return completed.returncode == 0 and presented == [identity.known_host]
 
 
 def _validate_credential(client: ConnectClient, identity: Any) -> bool:
@@ -124,16 +138,21 @@ def _inspect_repository(repository: Any, *, runner: Runner | None = None) -> boo
     if not path.is_dir():
         return False
     actual_runner = runner or Runner()
+    unset_git_environment = tuple(
+        sorted(name for name in os.environ if name.startswith("GIT_"))
+    )
     try:
         origin = actual_runner.run(
             ProcessSpec(
                 argv=(GIT, "-C", str(path), "remote", "get-url", "origin"),
+                unset_env=unset_git_environment,
                 display_name="Git origin inspection",
             )
         ).stdout.strip().rstrip("/")
         ssh_command = actual_runner.run(
             ProcessSpec(
                 argv=(GIT, "-C", str(path), "config", "--local", "--get", "core.sshCommand"),
+                unset_env=unset_git_environment,
                 display_name="Git transport inspection",
             )
         ).stdout.strip()
@@ -162,7 +181,7 @@ def run_doctor(
     route_factory: Callable[..., ConnectRoute] = ConnectRoute,
     connect_factory: Callable[..., ConnectClient] = ConnectClient,
     credential_validator: Callable[[ConnectClient, Any], bool] = _validate_credential,
-    host_trust_checker: Callable[[Any], bool] = _host_trust_matches,
+    host_trust_probe: Callable[[Any], bool] = _presented_host_key_matches,
     forgejo_probe: Callable[[ConnectClient, Any], int] = _forgejo_probe,
     repository_inspector: Callable[[Any], bool] = _inspect_repository,
 ) -> tuple[CheckResult, ...]:
@@ -228,7 +247,7 @@ def run_doctor(
                     "exact field and fingerprint are approved" if credential_ok else "exact field or fingerprint is invalid",
                 )
             )
-            host_ok = host_trust_checker(config.forgejo)
+            host_ok = host_trust_probe(config.forgejo)
             results.append(
                 _result(
                     "PASS" if host_ok else "FAIL",
@@ -238,7 +257,11 @@ def run_doctor(
                 )
             )
             try:
-                probe_status = forgejo_probe(client, config.forgejo) if credential_ok else 255
+                probe_status = (
+                    forgejo_probe(client, config.forgejo)
+                    if credential_ok and host_ok
+                    else 255
+                )
             except (AgentError, OSError, ValueError):
                 probe_status = 255
             # OpenSSH -T commonly exits 1 after a successful server-side no-shell
@@ -305,8 +328,15 @@ def enroll_keychain(
             raise AgentError("bastion key file is unavailable") from None
         if not stat.S_ISREG(mode):
             raise AgentError("bastion key must be a regular non-symlink file")
-        chmod(key_path, 0o600)
-        if empty_passphrase_probe(key_path) == 0:
+        try:
+            chmod(key_path, 0o600)
+        except OSError:
+            raise AgentError("bastion key permissions could not be set") from None
+        try:
+            is_unencrypted = empty_passphrase_probe(key_path) == 0
+        except OSError:
+            raise AgentError("bastion key validation could not be completed") from None
+        if is_unencrypted:
             raise AgentError("bastion key is unencrypted")
     keychain = keychain_factory()
     keychain.enroll(service, keychain.local_account())
