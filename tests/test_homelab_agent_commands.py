@@ -452,6 +452,7 @@ class CommandHelpTests(unittest.TestCase):
                 "  ssh TARGET -- COMMAND...\n"
                 "  op <approved 1Password command>\n"
                 "  tea -- TEA_ARGS...\n"
+                "  forgejo checks|deploy <approved Forgejo policy command>\n"
             ),
             ("git", "--help"): (
                 "usage: homelab-agent-git clone NAME|clone-foundation|configure PATH|fetch NAME\n\n"
@@ -484,6 +485,16 @@ class CommandHelpTests(unittest.TestCase):
                 "\n"
                 "TEA_ARGS are passed unchanged to Tea after ephemeral authentication to the\n"
                 "approved Forgejo server.\n"
+            ),
+            ("forgejo", "--help"): (
+                "usage: homelab-agent-forgejo COMMAND\n"
+                "\n"
+                "Approved commands:\n"
+                "  checks status infra SHA\n"
+                "  checks wait infra SHA [--timeout SECONDS]\n"
+                "  deploy stacks --target-host HOST --reason TEXT [--stacks CSV] [--post-deploy-configure]\n"
+                "  deploy status RUN_ID\n"
+                "  deploy wait RUN_ID [--timeout SECONDS]\n"
             ),
         }
         for argv, help_text in expected.items():

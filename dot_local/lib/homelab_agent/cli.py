@@ -15,6 +15,7 @@ from .op_command import run_op
 from .process import AgentError
 from .ssh_session import ConnectRoute, EphemeralAgent, run_pinned_ssh, run_target_ssh
 from .tea_session import run_tea
+from .forgejo_policy import run_authenticated_forgejo
 
 
 _MAIN_HELP = """usage: homelab-agent <command>
@@ -26,6 +27,7 @@ Commands:
   ssh TARGET -- COMMAND...
   op <approved 1Password command>
   tea -- TEA_ARGS...
+  forgejo checks|deploy <approved Forgejo policy command>
 """
 _GIT_HELP = """usage: homelab-agent-git clone NAME|clone-foundation|configure PATH|fetch NAME
 
@@ -59,6 +61,15 @@ _TEA_HELP = """usage: homelab-agent-tea -- TEA_ARGS...
 TEA_ARGS are passed unchanged to Tea after ephemeral authentication to the
 approved Forgejo server.
 """
+_FORGEJO_HELP = """usage: homelab-agent-forgejo COMMAND
+
+Approved commands:
+  checks status infra SHA
+  checks wait infra SHA [--timeout SECONDS]
+  deploy stacks --target-host HOST --reason TEXT [--stacks CSV] [--post-deploy-configure]
+  deploy status RUN_ID
+  deploy wait RUN_ID [--timeout SECONDS]
+"""
 
 
 def _help(arguments: Sequence[str]) -> str | None:
@@ -73,6 +84,8 @@ def _help(arguments: Sequence[str]) -> str | None:
         return _OP_HELP
     if arguments == ["tea", "--help"]:
         return _TEA_HELP
+    if arguments == ["forgejo", "--help"]:
+        return _FORGEJO_HELP
     return None
 
 
@@ -87,6 +100,8 @@ def _valid_invocation(arguments: Sequence[str]) -> bool:
         return len(arguments) >= 2
     if arguments and arguments[0] == "tea":
         return len(arguments) >= 3 and arguments[1] == "--"
+    if arguments and arguments[0] == "forgejo":
+        return _valid_forgejo_invocation(arguments[1:])
     if arguments and arguments[0] == "git":
         return (
             len(arguments) == 2 and arguments[1] == "clone-foundation"
@@ -100,6 +115,35 @@ def _valid_invocation(arguments: Sequence[str]) -> bool:
     return False
 
 
+def _valid_forgejo_invocation(arguments: Sequence[str]) -> bool:
+    """Reject policy widening before any credential setup occurs."""
+    if len(arguments) == 4 and arguments[:2] == ["checks", "status"]:
+        return True
+    if len(arguments) in {4, 6} and arguments[:2] == ["checks", "wait"]:
+        return len(arguments) == 4 or arguments[4] == "--timeout"
+    if len(arguments) == 3 and arguments[:2] == ["deploy", "status"]:
+        return True
+    if len(arguments) in {3, 5} and arguments[:2] == ["deploy", "wait"]:
+        return len(arguments) == 3 or arguments[3] == "--timeout"
+    if arguments[:2] != ["deploy", "stacks"]:
+        return False
+    allowed = {"--target-host", "--reason", "--stacks", "--post-deploy-configure"}
+    seen: set[str] = set()
+    index = 2
+    while index < len(arguments):
+        option = arguments[index]
+        if option not in allowed or option in seen:
+            return False
+        seen.add(option)
+        if option == "--post-deploy-configure":
+            index += 1
+        elif index + 1 < len(arguments):
+            index += 2
+        else:
+            return False
+    return {"--target-host", "--reason"}.issubset(seen)
+
+
 def _usage(arguments: Sequence[str]) -> str:
     if arguments and arguments[0] == "ssh":
         return "usage: homelab-agent ssh TARGET -- COMMAND..."
@@ -107,6 +151,8 @@ def _usage(arguments: Sequence[str]) -> str:
         return "usage: homelab-agent op <approved 1Password command>"
     if arguments and arguments[0] == "tea":
         return "usage: homelab-agent tea -- TEA_ARGS..."
+    if arguments and arguments[0] == "forgejo":
+        return "usage: homelab-agent forgejo checks|deploy <approved Forgejo policy command>"
     if arguments and arguments[0] == "git":
         return "usage: homelab-agent git clone NAME|clone-foundation|configure PATH|fetch NAME"
     if arguments and arguments[0] == "doctor":
@@ -209,6 +255,7 @@ def main(
     op_runner: Callable[[Sequence[str]], int] = run_op,
     git_runner: Callable[[Sequence[str]], int] = run_git,
     tea_runner: Callable[[Sequence[str]], int] = run_tea,
+    forgejo_runner: Callable[[Sequence[str]], int] | None = None,
     doctor_runner: Callable[[bool], Sequence[CheckResult]] | None = None,
     enroll_runner: Callable[[str], None] | None = None,
     output: TextIO | None = None,
@@ -262,6 +309,10 @@ def main(
             return git_runner(arguments[1:])
         if arguments[0] == "tea":
             return tea_runner(arguments[2:])
+        if arguments[0] == "forgejo":
+            if forgejo_runner is not None:
+                return forgejo_runner(arguments[1:])
+            return run_authenticated_forgejo(arguments[1:], output=actual_output)
         return run(
             arguments,
             load=load,

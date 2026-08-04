@@ -102,9 +102,11 @@ class TeaSession:
         completed = self._execute_interactive((TEA, *arguments), self._child_environment())
         return completed.returncode
 
-    def api_json(self, arguments: Sequence[str]) -> object:
+    def api_json(self, arguments: Sequence[str], *, input_json: object | None = None) -> object:
         """Call ``tea api`` and return only a valid JSON response."""
-        completed = self._execute((TEA, "api", *arguments), self._child_environment())
+        completed = self._execute(
+            (TEA, "api", *arguments), self._child_environment(), input_json=input_json
+        )
         if completed.returncode != 0:
             raise AgentError("Tea API request failed")
         try:
@@ -143,10 +145,13 @@ class TeaSession:
         return completed
 
     def _execute(
-        self, argv: tuple[str, ...], environment: Mapping[str, str]
+        self, argv: tuple[str, ...], environment: Mapping[str, str], *, input_json: object | None = None
     ) -> subprocess.CompletedProcess[str]:
         try:
-            return self._executor(argv, text=True, capture_output=True, env=dict(environment))
+            kwargs: dict[str, object] = {"text": True, "capture_output": True, "env": dict(environment)}
+            if input_json is not None:
+                kwargs["input"] = json.dumps(input_json)
+            return self._executor(argv, **kwargs)
         except Exception:
             raise AgentError("Tea process could not be started") from None
 

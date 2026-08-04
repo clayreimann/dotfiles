@@ -167,7 +167,7 @@ Run the Step 2 command, then commit as
 - Consumes: `TeaSession.api_json`, `ForgejoAutomation`, and the exact Forgejo 14 response fields `workflow_runs`, `workflow_id`, `id`, `status`, `html_url`, `commit_sha`, `created`, and dispatch `id`.
 - Produces: `checks status`, `checks wait`, `deploy stacks`, `deploy status`, and `deploy wait`.
 
-- [ ] **Step 1: Write failing policy tests**
+- [x] **Step 1: Write failing policy tests**
 
 Cover newest-run-per-workflow selection, missing/pending/success/failure state
 aggregation, timeout, malformed JSON, unexpected fields/types, redacted Tea
@@ -177,7 +177,7 @@ caller-controlled `confirm`; assert the only dispatch body uses `main`,
 `return_run_info: true`, `confirm: apply`, and the approved inputs. Prove
 `blocked` reports the production approval gate without approving it.
 
-- [ ] **Step 2: Run focused tests and confirm RED**
+- [x] **Step 2: Run focused tests and confirm RED**
 
 Run:
 
@@ -185,14 +185,14 @@ Run:
 /opt/homebrew/bin/python3.12 -m unittest tests.test_homelab_agent_forgejo -v
 ```
 
-- [ ] **Step 3: Implement parsing, polling, and dispatch**
+- [x] **Step 3: Implement parsing, polling, and dispatch**
 
 Use `tea api` only through `TeaSession`. Poll at a bounded interval with an
 injectable clock/sleeper. Return nonzero for terminal failures and timeout;
 return a distinct public waiting result for a blocked deployment. Do not add
 merge, approval, secret, workflow-management, or arbitrary API commands.
 
-- [ ] **Step 4: Run the full suite and diff check**
+- [x] **Step 4: Run the full suite and diff check**
 
 Run:
 
@@ -204,7 +204,7 @@ git diff --check
 Expected: all tests pass except the established opt-in Keychain integration
 skip, and the diff check is silent.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add dot_local/bin/executable_homelab-agent-forgejo dot_local/lib/homelab_agent tests docs/superpowers/plans/2026-08-04-tea-forgejo-tooling.md
