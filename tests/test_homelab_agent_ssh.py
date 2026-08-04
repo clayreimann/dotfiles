@@ -609,6 +609,13 @@ class ConnectRouteTests(unittest.TestCase):
             self.assertIn("IdentitiesOnly=yes", argv)
             self.assertIn("IdentityAgent=none", argv)
             assert_publickey_only(self, argv, batch_mode="no")
+            identity_reset_index = argv.index("IdentityFile=none")
+            approved_identity_index = argv.index("-i")
+            self.assertLess(identity_reset_index, approved_identity_index)
+            self.assertEqual(
+                "/Users/clay/.ssh/homelab_bastion_bootstrap",
+                argv[approved_identity_index + 1],
+            )
             self.assertIn("127.0.0.1:18080:192.168.42.253:8080", argv)
             self.assertIn(str(bastion().encrypted_key_path), argv)
             self.assertIn("StrictHostKeyChecking=yes", argv)

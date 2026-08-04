@@ -466,6 +466,8 @@ def _open_bastion_tunnel(
                     "GlobalKnownHostsFile=/dev/null",
                     "-o",
                     "VerifyHostKeyDNS=no",
+                    "-o",
+                    "IdentityFile=none",
                     "-i",
                     str(bastion.encrypted_key_path),
                     "-L",
