@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+import os
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,7 @@ GIT = "/usr/bin/git"
 SSH_COMMAND = "/Users/clay/.local/bin/homelab-forgejo-ssh"
 
 
-class UsageError(ValueError):
+class UsageError(AgentError):
     """The requested Git operation is outside the small approved grammar."""
 
 
@@ -23,7 +24,14 @@ class GitError(AgentError):
 
 
 def _run(runner: Runner, argv: tuple[str, ...], display_name: str):
-    return runner.run(ProcessSpec(argv=argv, display_name=display_name))
+    """Run Git without inheriting any caller-controlled Git behavior."""
+    return runner.run(
+        ProcessSpec(
+            argv=argv,
+            unset_env=tuple(sorted(name for name in os.environ if name.startswith("GIT_"))),
+            display_name=display_name,
+        )
+    )
 
 
 def _normal_remote(remote: str) -> str:
@@ -45,6 +53,16 @@ def _check_repository(repository: Repository, *, runner: Runner) -> None:
         raise GitError("configured repository destination is not an approved Git worktree") from None
     if worktree.stdout.strip() != "true":
         raise GitError("configured repository destination is not an approved Git worktree")
+    try:
+        top_level = _run(
+            runner,
+            (GIT, "-C", str(path), "rev-parse", "--show-toplevel"),
+            "Git worktree top-level check",
+        )
+    except AgentError:
+        raise GitError("configured repository destination is not the top-level Git worktree") from None
+    if Path(top_level.stdout.strip()).resolve() != path.resolve():
+        raise GitError("configured repository destination is not the top-level Git worktree")
     try:
         origin = _run(
             runner,

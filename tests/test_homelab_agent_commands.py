@@ -485,7 +485,13 @@ class GitCommandTests(unittest.TestCase):
         from homelab_agent.git_command import clone_repository
 
         repository = self.repositories[0]
-        self.runner = FakeRunner([completed("true\n"), completed(repository.remote + "/\n")])
+        self.runner = FakeRunner(
+            [
+                completed("true\n"),
+                completed(str(repository.path) + "\n"),
+                completed(repository.remote + "/\n"),
+            ]
+        )
         with patch.object(Path, "exists", return_value=True), patch.object(
             Path, "is_dir", return_value=True
         ):
@@ -503,7 +509,13 @@ class GitCommandTests(unittest.TestCase):
         from homelab_agent.git_command import GitError, clone_repository
 
         repository = self.repositories[0]
-        self.runner = FakeRunner([completed("true\n"), completed("ssh://git@elsewhere:2222/homelab/infra.git\n")])
+        self.runner = FakeRunner(
+            [
+                completed("true\n"),
+                completed(str(repository.path) + "\n"),
+                completed("ssh://git@elsewhere:2222/homelab/infra.git\n"),
+            ]
+        )
         with patch.object(Path, "exists", return_value=True), patch.object(
             Path, "is_dir", return_value=True
         ):
@@ -526,7 +538,13 @@ class GitCommandTests(unittest.TestCase):
         from homelab_agent.git_command import run_git
 
         repository = self.repositories[0]
-        self.runner = FakeRunner([completed("true\n"), completed(repository.remote + "\n")])
+        self.runner = FakeRunner(
+            [
+                completed("true\n"),
+                completed(str(repository.path) + "\n"),
+                completed(repository.remote + "\n"),
+            ]
+        )
         with patch.object(Path, "exists", return_value=True), patch.object(
             Path, "is_dir", return_value=True
         ):
@@ -560,6 +578,88 @@ class GitCommandTests(unittest.TestCase):
 
         self.assertEqual(9, rc)
         self.assertEqual([("clone", "infra")], observed)
+
+    def test_subdirectory_of_a_matching_worktree_is_refused(self) -> None:
+        from homelab_agent.git_command import GitError, clone_repository
+
+        repository = self.repositories[0]
+        self.runner = FakeRunner(
+            [
+                completed("true\n"),
+                completed(str(repository.path / "nested") + "\n"),
+            ]
+        )
+        with patch.object(Path, "exists", return_value=True), patch.object(
+            Path, "is_dir", return_value=True
+        ):
+            with self.assertRaisesRegex(GitError, "top-level Git worktree"):
+                clone_repository(repository, runner=self.runner)
+
+        self.assertEqual(2, len(self.runner.calls))
+
+    def test_every_git_child_scrubs_inherited_git_controls_and_parent_stays_unchanged(self) -> None:
+        from homelab_agent.git_command import clone_repository, run_git
+
+        inherited = {
+            "GIT_SSH_COMMAND": "ssh -o ProxyCommand=unapproved",
+            "GIT_SSH": "/tmp/unapproved-ssh",
+            "GIT_DIR": "/tmp/unapproved-dir",
+            "GIT_WORK_TREE": "/tmp/unapproved-worktree",
+            "GIT_COMMON_DIR": "/tmp/unapproved-common",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.sshCommand",
+            "GIT_CONFIG_VALUE_0": "ssh unapproved",
+        }
+        executor = EnvironmentCapturingProcess()
+        repository = self.repositories[0]
+
+        with patch.dict(os.environ, inherited, clear=False), patch.object(
+            Path, "exists", return_value=False
+        ):
+            clone_repository(repository, runner=Runner(executor))
+            self.assertEqual(inherited, {name: os.environ[name] for name in inherited})
+
+        for call in executor.calls:
+            for name in inherited:
+                self.assertNotIn(name, call["env"])
+
+        self.runner = FakeRunner(
+            [
+                completed("true\n"),
+                completed(str(repository.path) + "\n"),
+                completed(repository.remote + "\n"),
+            ]
+        )
+        with patch.dict(os.environ, inherited, clear=False), patch.object(
+            Path, "exists", return_value=True
+        ), patch.object(Path, "is_dir", return_value=True):
+            run_git(["fetch", "infra"], load=lambda: self.config, runner=self.runner)
+            self.assertEqual(inherited, {name: os.environ[name] for name in inherited})
+
+        for call in self.runner.calls:
+            self.assertTrue(set(inherited).issubset(set(call.unset_env)))  # type: ignore[attr-defined]
+
+    def test_cli_reports_git_usage_errors_without_keychain_or_connect(self) -> None:
+        from homelab_agent import cli
+        from homelab_agent.git_command import run_git
+
+        for argv in (
+            ["git", "clone", "unknown"],
+            ["git", "configure", "/Users/clay/Code/elsewhere"],
+        ):
+            with self.subTest(argv=argv), patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                rc = cli.main(
+                    argv,
+                    keychain_factory=lambda: self.fail("Git must not read Keychain"),
+                    connect_factory=lambda *_args, **_kwargs: self.fail("Git must not connect"),
+                    git_runner=lambda arguments: run_git(
+                        arguments, load=lambda: self.config, runner=self.runner
+                    ),
+                )
+
+            self.assertEqual(1, rc)
+            self.assertIn("homelab-agent:", stderr.getvalue())
+            self.assertEqual([], self.runner.calls)
 
 
 if __name__ == "__main__":
