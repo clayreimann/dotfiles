@@ -57,6 +57,7 @@ _TUNNEL_WAIT_SECONDS = 5.0
 _CONTROL_CHECK_SECONDS = 1.0
 _ASKPASS_SERVICE_ENV = "HOMELAB_AGENT_ASKPASS_SERVICE"
 _ASKPASS_ACCOUNT_ENV = "HOMELAB_AGENT_ASKPASS_ACCOUNT"
+_SHORT_PRIVATE_TEMP_ROOT = "/private/tmp"
 _APPROVED_BASTION_KEY_PATH = Path(
     "/Users/clay/.ssh/homelab_bastion_bootstrap"
 )
@@ -352,7 +353,12 @@ def _known_hosts_file(known_host: str) -> Iterator[Path]:
 
 @contextmanager
 def _askpass_program() -> Iterator[Path]:
-    with tempfile.TemporaryDirectory(prefix="homelab-agent-askpass-") as directory:
+    # OpenSSH appends a random suffix while binding a multiplex socket. The
+    # normal macOS TMPDIR is long enough to exceed sockaddr_un.sun_path after
+    # that suffix is added, so keep this mode-0700 directory under a short root.
+    with tempfile.TemporaryDirectory(
+        prefix="homelab-agent-askpass-", dir=_SHORT_PRIVATE_TEMP_ROOT
+    ) as directory:
         path = Path(directory) / "askpass"
         path.write_text(
             "#!/bin/zsh\n"
