@@ -38,6 +38,8 @@ _PINNED_SECURITY_OPTIONS = frozenset(
         "stricthostkeychecking",
         "userknownhostsfile",
         "globalknownhostsfile",
+        "knownhostscommand",
+        "verifyhostkeydns",
     }
 )
 SshExecutor = Callable[..., subprocess.CompletedProcess[str]]

@@ -218,6 +218,29 @@ class PinnedForgejoSshTests(unittest.TestCase):
                 self.assertEqual([], fake_process.calls)
                 self.assertEqual([], ssh_calls)
 
+    def test_host_trust_option_overrides_stop_before_starting_an_agent_or_ssh(self) -> None:
+        overrides = {
+            "attached known-hosts command equals": ["-oKnownHostsCommand=/tmp/other-known-hosts"],
+            "separate known-hosts command space": ["-o", "KnownHostsCommand /tmp/other-known-hosts"],
+            "separate DNS verification equals": ["-o", "VerifyHostKeyDNS=yes"],
+            "attached DNS verification space": ["-oVerifyHostKeyDNS yes"],
+        }
+        for name, options in overrides.items():
+            with self.subTest(name=name):
+                fake_process = FakeProcess([])
+                ssh_calls: list[tuple[str, ...]] = []
+
+                with self.assertRaisesRegex(AgentError, "SSH invocation overrides pinned security settings"):
+                    run_pinned_ssh(
+                        identity(),
+                        [*options, "git@git.4406.madtown.cloud", "git-upload-pack 'homelab/infra.git'"],
+                        agent=EphemeralAgent(FakeConnect(), Runner(fake_process)),
+                        ssh_executor=lambda argv: ssh_calls.append(argv),  # type: ignore[return-value]
+                    )
+
+                self.assertEqual([], fake_process.calls)
+                self.assertEqual([], ssh_calls)
+
     def test_login_and_port_overrides_stop_before_starting_an_agent_or_ssh(self) -> None:
         overrides = {
             "separate login": ["-l", "otheruser"],
