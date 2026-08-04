@@ -772,6 +772,7 @@ class DoctorAndEnrollmentTests(unittest.TestCase):
             keychain_factory=lambda: self.keychain,
             route_factory=lambda **_kwargs: Route(),
             connect_factory=lambda *_args, **_kwargs: Client(),
+            connect_scope_checker=lambda *_args, **_kwargs: True,
             credential_validator=lambda *_args, **_kwargs: False,
             host_trust_probe=lambda _identity: False,
             forgejo_probe=lambda *_args, **_kwargs: 255,
@@ -802,6 +803,7 @@ class DoctorAndEnrollmentTests(unittest.TestCase):
             keychain_factory=lambda: self.keychain,
             route_factory=lambda **_kwargs: Route(),
             connect_factory=lambda *_args, **_kwargs: Client(),
+            connect_scope_checker=lambda *_args, **_kwargs: True,
             credential_validator=lambda *_args, **_kwargs: True,
             host_trust_probe=lambda _identity: False,
             forgejo_probe=lambda *_args, **_kwargs: probe_calls.append("auth") or 1,
@@ -833,6 +835,51 @@ class DoctorAndEnrollmentTests(unittest.TestCase):
         )
         self.assertTrue(scan.call_args.kwargs["capture_output"])
 
+    def test_presented_host_key_probe_ignores_public_ssh_keyscan_banner_lines(self) -> None:
+        from homelab_agent import doctor
+
+        captured = (
+            "# git.example:2222 SSH-2.0-OpenSSH_9.9\n"
+            "[git.example]:2222 ssh-ed25519 AAAAPinned\n"
+        )
+        with patch.object(
+            doctor.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(("ssh-keyscan",), 0, stdout=captured, stderr=""),
+        ):
+            self.assertTrue(doctor._presented_host_key_matches(self.config.forgejo))
+
+    def test_live_doctor_marks_connect_failed_when_health_lacks_scoped_vault_access(self) -> None:
+        class Route:
+            @contextmanager
+            def open(self, _config: object):
+                yield "http://connect.example:8080"
+
+        class Client:
+            def health(self) -> None:
+                return None
+
+        calls: list[str] = []
+        results = run_doctor(
+            live=True,
+            load=lambda: self.config,
+            executable_exists=lambda _path: True,
+            python_version=lambda: "3.12.7",
+            keychain_factory=lambda: self.keychain,
+            route_factory=lambda **_kwargs: Route(),
+            connect_factory=lambda *_args, **_kwargs: Client(),
+            connect_scope_checker=lambda _client, _identity: False,
+            credential_validator=lambda *_args, **_kwargs: calls.append("credential") or True,
+            forgejo_probe=lambda *_args, **_kwargs: calls.append("auth") or 1,
+        )
+
+        connect = next(result for result in results if result.category == "connect")
+        self.assertEqual("FAIL", connect.status)
+        self.assertEqual([], calls)
+        self.assertNotIn("PASS connect Homelab Secrets", "\n".join(
+            f"{result.status} {result.category} {result.name}" for result in results
+        ))
+
     def test_live_doctor_reports_clean_configured_clone_wiring_without_mutating_or_fetching(self) -> None:
         repository = Repository(
             "infra", "ssh://git@git.example:2222/homelab/infra.git", Path("/work/infra")
@@ -860,6 +907,7 @@ class DoctorAndEnrollmentTests(unittest.TestCase):
             keychain_factory=lambda: self.keychain,
             route_factory=lambda **_kwargs: Route(),
             connect_factory=lambda *_args, **_kwargs: Client(),
+            connect_scope_checker=lambda *_args, **_kwargs: True,
             credential_validator=lambda *_args, **_kwargs: True,
             host_trust_probe=lambda _identity: True,
             forgejo_probe=lambda *_args, **_kwargs: 1,

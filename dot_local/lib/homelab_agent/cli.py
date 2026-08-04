@@ -223,6 +223,7 @@ def _format_check(check: CheckResult) -> str:
         "server authorization is unavailable",
         "approved route is healthy",
         "approved vault is reachable",
+        "approved vault access failed",
         "exact field and fingerprint are approved",
         "exact field or fingerprint is invalid",
         "pinned host key is approved",

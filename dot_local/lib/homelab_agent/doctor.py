@@ -102,8 +102,21 @@ def _presented_host_key_matches(identity: Any) -> bool:
         )
     except OSError:
         return False
-    presented = [line for line in completed.stdout.splitlines() if line.strip()]
+    presented = [
+        line
+        for line in completed.stdout.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
     return completed.returncode == 0 and presented == [identity.known_host]
+
+
+def _connect_scope_is_available(client: ConnectClient, identity: Any) -> bool:
+    """Require an authenticated exact-item lookup, not just the unauthenticated health path."""
+    try:
+        client.get_item(identity.credential_item_id)
+    except AgentError:
+        return False
+    return True
 
 
 def _validate_credential(client: ConnectClient, identity: Any) -> bool:
@@ -180,6 +193,7 @@ def run_doctor(
     keychain_factory: Callable[[], Keychain] = Keychain,
     route_factory: Callable[..., ConnectRoute] = ConnectRoute,
     connect_factory: Callable[..., ConnectClient] = ConnectClient,
+    connect_scope_checker: Callable[[ConnectClient, Any], bool] = _connect_scope_is_available,
     credential_validator: Callable[[ConnectClient, Any], bool] = _validate_credential,
     host_trust_probe: Callable[[Any], bool] = _presented_host_key_matches,
     forgejo_probe: Callable[[ConnectClient, Any], int] = _forgejo_probe,
@@ -237,6 +251,23 @@ def run_doctor(
             client = connect_factory(connect_url, token, vault_name=config.vault_name)
             client.health()
             results.append(_result("PASS", "network", "Connect route", "approved route is healthy"))
+            if not connect_scope_checker(client, config.forgejo):
+                results.append(
+                    _result(
+                        "FAIL",
+                        "connect",
+                        "Homelab Secrets",
+                        "approved vault access failed",
+                    )
+                )
+                results.extend(
+                    [
+                        _result("FAIL", "credential", "forgejo credential", "credential validation is unavailable"),
+                        _result("FAIL", "host-trust", "Forgejo host key", "host trust validation is unavailable"),
+                        _result("FAIL", "server-authorization", "Forgejo authentication", "server authorization is unavailable"),
+                    ]
+                )
+                return tuple(results)
             results.append(_result("PASS", "connect", "Homelab Secrets", "approved vault is reachable"))
             credential_ok = credential_validator(client, config.forgejo)
             results.append(
