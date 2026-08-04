@@ -221,7 +221,7 @@ class OpCommandTests(unittest.TestCase):
 
     def test_vault_and_read_commands_preserve_their_vault_scoped_cli_syntax(self) -> None:
         self.assertEqual(
-            ("vault", "list", "--format", "json"),
+            ("vault", "get", "Homelab Secrets", "--format", "json"),
             validate_op_argv(["vault", "list"]),
         )
         self.assertEqual(
@@ -263,12 +263,33 @@ class OpCommandTests(unittest.TestCase):
                 self.assertEqual(0, rc)
                 self.assertEqual("allowed child output\n", output.getvalue())
 
-    def test_vault_list_emits_only_the_unique_homelab_secrets_entry(self) -> None:
+    def test_create_and_edit_forward_successful_child_stdout(self) -> None:
+        cases = (
+            (["item", "create", "-"], '{"title": "Router"}'),
+            (["item", "edit", EDIT_ITEM_ID], '{"fields": []}'),
+        )
+
+        for argv, stdin in cases:
+            with self.subTest(argv=argv):
+                output = io.StringIO()
+                runner = FakeRunner([completed("mutation result\n")])
+                rc = run_op(
+                    argv,
+                    load=config,
+                    keychain_factory=lambda: self.keychain,
+                    route_factory=lambda **_kwargs: self.route,
+                    runner=runner,
+                    stdin=io.StringIO(stdin),
+                    output=output,
+                )
+                self.assertEqual(0, rc)
+                self.assertEqual("mutation result\n", output.getvalue())
+
+    def test_vault_list_uses_confined_get_and_emits_a_list_shaped_response(self) -> None:
         self.runner = FakeRunner(
             [
                 completed(
-                    '[{"id":"personal-id","name":"Personal"},'
-                    '{"id":"homelab-id","name":"Homelab Secrets"}]'
+                    '{"id":"homelab-id","name":"Homelab Secrets"}'
                 )
             ]
         )
@@ -277,26 +298,33 @@ class OpCommandTests(unittest.TestCase):
 
         call = self.runner.calls[-1]
         self.assertEqual(
-            ("/opt/homebrew/bin/op", "vault", "list", "--format", "json"),
+            (
+                "/opt/homebrew/bin/op",
+                "vault",
+                "get",
+                "Homelab Secrets",
+                "--format",
+                "json",
+            ),
             call.argv,  # type: ignore[attr-defined]
         )
         self.assertEqual(
-            '{"id": "homelab-id", "name": "Homelab Secrets"}\n',
+            '[{"id": "homelab-id", "name": "Homelab Secrets"}]\n',
             self.output.getvalue(),
         )
 
-    def test_vault_list_fails_closed_for_zero_or_multiple_exact_matches(self) -> None:
+    def test_vault_list_fails_closed_for_invalid_or_mismatched_metadata(self) -> None:
         payloads = (
-            '[{"id":"personal-id","name":"Personal"}]',
-            '[{"id":"one","name":"Homelab Secrets"},'
-            '{"id":"two","name":"Homelab Secrets"}]',
+            "not-json",
+            '[{"id":"homelab-id","name":"Homelab Secrets"}]',
+            '{"id":"personal-id","name":"Personal"}',
         )
 
         for payload in payloads:
             with self.subTest(payload=payload):
                 output = io.StringIO()
                 runner = FakeRunner([completed(payload)])
-                with self.assertRaisesRegex(AgentError, "exact Homelab Secrets vault"):
+                with self.assertRaisesRegex(AgentError, "exact Homelab Secrets vault metadata"):
                     run_op(
                         ["vault", "list"],
                         load=config,

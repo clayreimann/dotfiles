@@ -67,7 +67,7 @@ def validate_op_argv(argv: Sequence[str]) -> tuple[str, ...]:
         return (*arguments, "--vault", _VAULT_NAME)
 
     if arguments == ("vault", "list"):
-        return ("vault", "list", "--format", "json")
+        return ("vault", "get", _VAULT_NAME, "--format", "json")
     if arguments == ("vault", "get", _VAULT_NAME):
         return arguments
     if arguments == ("item", "list"):
@@ -112,17 +112,14 @@ def _scoped_vault_list(payload: str) -> str:
     try:
         decoded = json.loads(payload)
     except json.JSONDecodeError:
-        raise AgentError("vault list did not return valid JSON") from None
-    if not isinstance(decoded, list):
-        raise AgentError("vault list did not return valid JSON")
-    matches = [
-        entry
-        for entry in decoded
-        if isinstance(entry, dict) and entry.get("name") == _VAULT_NAME
-    ]
-    if len(matches) != 1:
-        raise AgentError("vault list did not return exactly one exact Homelab Secrets vault")
-    return json.dumps(matches[0]) + "\n"
+        raise AgentError(
+            "vault list did not return exact Homelab Secrets vault metadata"
+        ) from None
+    if not isinstance(decoded, dict) or decoded.get("name") != _VAULT_NAME:
+        raise AgentError(
+            "vault list did not return exact Homelab Secrets vault metadata"
+        )
+    return json.dumps([decoded]) + "\n"
 
 
 def run_op(
@@ -136,7 +133,8 @@ def run_op(
     output: TextIO = sys.stdout,
 ) -> int:
     """Run an approved `op` command with Connect credentials scoped to its child."""
-    arguments = validate_op_argv(argv)
+    caller_arguments = tuple(argv)
+    arguments = validate_op_argv(caller_arguments)
     json_input = _json_stdin(arguments, stdin)
     config = load()
     if config.vault_name != _VAULT_NAME:
@@ -160,9 +158,9 @@ def run_op(
                 display_name="approved 1Password command",
             )
         )
-    if arguments[:2] == ("vault", "list"):
+    if caller_arguments == ("vault", "list"):
         output.write(_scoped_vault_list(completed.stdout or ""))
-    elif arguments[:2] not in (("item", "create"), ("item", "edit")):
+    else:
         output.write(completed.stdout or "")
     output.flush()
     return 0
