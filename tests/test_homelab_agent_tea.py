@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dot_local" / "lib"
 
 TEA = "/opt/homebrew/bin/tea"
 TOKEN = "api-token-fixture"
+LEGACY_MAP_PATH = Path(__file__).with_name("fixtures") / "credential-map-v1.json"
 
 
 class FakeConnectClient:
@@ -181,8 +182,11 @@ class TeaSessionTests(unittest.TestCase):
         self.assertEqual(1, len(executor.calls))
 
     def test_rejects_a_legacy_credential_map_before_keychain_or_connect_access(self) -> None:
+        from homelab_agent.config import load_config
         from homelab_agent.process import AgentError
         from homelab_agent.tea_session import run_tea
+
+        legacy_config = load_config(LEGACY_MAP_PATH)
 
         def unexpected_keychain():
             self.fail("legacy Tea policy must not read Keychain")
@@ -190,14 +194,22 @@ class TeaSessionTests(unittest.TestCase):
         def unexpected_route(**_kwargs: Any):
             self.fail("legacy Tea policy must not open Connect")
 
+        def unexpected_client(*_args: Any, **_kwargs: Any):
+            self.fail("legacy Tea policy must not create a Connect client")
+
+        def unexpected_tea(*_args: Any, **_kwargs: Any):
+            self.fail("legacy Tea policy must not start Tea")
+
         with self.assertRaisesRegex(
             AgentError, "Tea workflow policy requires credential map version 2"
         ):
             run_tea(
                 ["issues", "list"],
-                load=lambda: SimpleNamespace(version=1),
+                load=lambda: legacy_config,
                 keychain_factory=unexpected_keychain,
                 route_factory=unexpected_route,
+                connect_factory=unexpected_client,
+                executor=unexpected_tea,
             )
 
     def test_accepts_the_installed_tea_version_format_with_terminal_color_escapes(self) -> None:

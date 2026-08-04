@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dot_local" / "lib"))
 
-from homelab_agent.config import ConfigError
+from homelab_agent.config import ConfigError, load_config
 from homelab_agent.models import Bastion, ManagedTarget, SshIdentity
 from homelab_agent.process import AgentError, Runner, Secret
 from homelab_agent import ssh_session
@@ -28,6 +28,7 @@ from homelab_agent.ssh_session import EphemeralAgent, run_pinned_ssh
 PRIVATE_KEY = "-----BEGIN OPENSSH PRIVATE KEY-----\nsecret-line-one\nsecret-line-two\n-----END OPENSSH PRIVATE KEY-----\n"
 PUBLIC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestPublicKey forgejo-agent\n"
 FINGERPRINT = "SHA256:verified-agent-key"
+LEGACY_MAP_PATH = Path(__file__).with_name("fixtures") / "credential-map-v1.json"
 
 
 def identity() -> SshIdentity:
@@ -1149,6 +1150,57 @@ class ManagedTargetSshTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_real_v1_map_reaches_the_forgejo_ssh_transport(self) -> None:
+        from homelab_agent import cli
+
+        config = load_config(LEGACY_MAP_PATH)
+        observed: dict[str, object] = {}
+
+        class Keychain:
+            def local_account(self) -> str:
+                return "test-mac"
+
+            def read(self, service: str, account: str) -> Secret:
+                observed["keychain"] = (service, account)
+                return Secret("connect-token")
+
+        class Route:
+            @contextmanager
+            def open(self, supplied_config: object):
+                observed["route_config"] = supplied_config
+                yield "http://approved-connect.example:8080"
+
+        class ConnectClient:
+            def __init__(self, url: str, token: Secret, *, vault_name: str) -> None:
+                observed["connect"] = (url, token, vault_name)
+
+        def transport(identity: SshIdentity, remote_args: list[str], **kwargs: object) -> int:
+            observed["identity"] = identity
+            observed["remote_args"] = remote_args
+            observed["agent"] = kwargs["agent"]
+            return 19
+
+        with patch.object(cli, "EphemeralAgent", lambda client: ("agent", client)):
+            result = cli.run(
+                ["forgejo-ssh", "--", "git@git.4406.madtown.cloud", "git-upload-pack 'homelab/infra.git'"],
+                load=lambda: config,
+                keychain_factory=Keychain,
+                connect_factory=ConnectClient,
+                route_factory=lambda **_kwargs: Route(),
+                transport=transport,
+            )
+
+        self.assertEqual(19, result)
+        self.assertIs(config, observed["route_config"])
+        self.assertEqual(config.forgejo, observed["identity"])
+        self.assertEqual(
+            ["git@git.4406.madtown.cloud", "git-upload-pack 'homelab/infra.git'"],
+            observed["remote_args"],
+        )
+        self.assertEqual(
+            (config.connect_keychain_service, "test-mac"), observed["keychain"]
+        )
+
     def test_unknown_target_never_reads_keychain(self) -> None:
         from homelab_agent import cli
 

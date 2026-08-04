@@ -16,6 +16,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dot_local" / "lib"
 from homelab_agent.config import ConfigError, load_config
 
 
+LEGACY_MAP_PATH = Path(__file__).with_name("fixtures") / "credential-map-v1.json"
+
+
 def valid_document() -> dict[str, object]:
     """Return a complete, non-secret version-2 public credential map."""
     return {
@@ -89,17 +92,7 @@ def valid_document() -> dict[str, object]:
 
 def legacy_document() -> dict[str, object]:
     """Return the exact pre-Tea version-1 public credential-map shape."""
-    document = valid_document()
-    document["version"] = 1
-    forgejo = document["forgejo"]
-    assert isinstance(forgejo, dict)
-    for field in ("api_url", "api_user", "api_token_field"):
-        del forgejo[field]
-    del document["forgejo_automation"]
-    tools = document["tools"]
-    assert isinstance(tools, dict)
-    del tools["tea"]
-    return document
+    return json.loads(LEGACY_MAP_PATH.read_text(encoding="utf-8"))
 
 
 class LoadConfigTests(unittest.TestCase):

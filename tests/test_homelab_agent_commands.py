@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dot_local" / "lib"))
 
+from homelab_agent.config import load_config
 from homelab_agent.op_command import UsageError, run_op, validate_op_argv
 from homelab_agent.process import AgentError, Runner, Secret
 from homelab_agent.models import Repository
@@ -23,6 +24,7 @@ from homelab_agent.doctor import CheckResult, _inspect_repository, enroll_keycha
 
 TOKEN = "token-value"
 EDIT_ITEM_ID = "yznfzgoql7jl4oa6spa7vm3644"
+LEGACY_MAP_PATH = Path(__file__).with_name("fixtures") / "credential-map-v1.json"
 
 
 class FakeKeychain:
@@ -792,6 +794,67 @@ class GitCommandTests(unittest.TestCase):
             self.assertEqual(1, rc)
             self.assertIn("homelab-agent:", stderr.getvalue())
             self.assertEqual([], self.runner.calls)
+
+
+class LegacyCredentialMapCommandTests(unittest.TestCase):
+    def test_real_v1_map_reaches_non_live_doctor_without_a_tea_check(self) -> None:
+        config = load_config(LEGACY_MAP_PATH)
+
+        results = run_doctor(
+            live=False,
+            load=lambda: config,
+            executable_exists=lambda _path: True,
+            python_version=lambda: "3.12.7",
+            keychain_factory=lambda: self.fail("non-live doctor must not read Keychain"),
+        )
+
+        self.assertIn(
+            CheckResult("PASS", "config", "credential map", "public configuration is approved"),
+            results,
+        )
+        self.assertNotIn("tea", {result.name for result in results})
+
+    def test_real_v1_map_reaches_the_configured_git_repository(self) -> None:
+        from homelab_agent.git_command import run_git
+
+        config = load_config(LEGACY_MAP_PATH)
+        observed: list[Repository] = []
+
+        def clone(repository: Repository, *, runner: object) -> None:
+            del runner
+            observed.append(repository)
+
+        with patch("homelab_agent.git_command.clone_repository", side_effect=clone):
+            result = run_git(["clone", "infra"], load=lambda: config)
+
+        self.assertEqual(0, result)
+        self.assertEqual([config.repositories[0]], observed)
+
+    def test_real_v1_map_reaches_the_op_connect_route(self) -> None:
+        config = load_config(LEGACY_MAP_PATH)
+        keychain = FakeKeychain()
+        route = FakeRoute()
+        runner = FakeRunner()
+
+        result = run_op(
+            ["item", "get", "item-id"],
+            load=lambda: config,
+            keychain_factory=lambda: keychain,
+            route_factory=lambda **_kwargs: route,
+            runner=runner,
+            stdin=io.StringIO(),
+            output=io.StringIO(),
+        )
+
+        self.assertEqual(0, result)
+        self.assertEqual([config], route.opened_with)
+        self.assertEqual(
+            [
+                ("local_account",),
+                ("read", config.connect_keychain_service, "test-mac"),
+            ],
+            keychain.calls,
+        )
 
 
 class DoctorAndEnrollmentTests(unittest.TestCase):
