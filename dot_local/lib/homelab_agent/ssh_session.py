@@ -96,6 +96,7 @@ class EphemeralAgent:
         )
         agent_environment: dict[str, str] = {}
         private_key: Secret | None = None
+        ssh_add_input: Secret | None = None
         socket: AgentSocket | None = None
         try:
             socket = _agent_socket(started.stdout)
@@ -104,10 +105,11 @@ class EphemeralAgent:
                 "SSH_AGENT_PID": str(socket.pid),
             }
             private_key = self._connect.get_string_field(item_id, field)
+            ssh_add_input = _ssh_add_input(private_key)
             self._runner.run(
                 ProcessSpec(
                     argv=("/usr/bin/ssh-add", "-"),
-                    stdin=private_key,
+                    stdin=ssh_add_input,
                     env_overlay=agent_environment,
                     unset_env=_AGENT_ENVIRONMENT_NAMES,
                     display_name="temporary SSH key load",
@@ -135,6 +137,7 @@ class EphemeralAgent:
                 raise AgentError("loaded SSH key fingerprint does not match expected fingerprint")
             yield socket
         finally:
+            ssh_add_input = None
             private_key = None
             prior_error = sys.exc_info()[0] is not None
             if socket is not None:
@@ -171,6 +174,12 @@ def _agent_socket(output: str) -> AgentSocket:
     if pid <= 0:
         raise AgentError("temporary SSH agent returned invalid environment")
     return AgentSocket(socket_path=values["SSH_AUTH_SOCK"], pid=pid)
+
+
+def _ssh_add_input(private_key: Secret) -> Secret:
+    """Keep Connect's stored text unchanged except for ssh-add's required final LF."""
+    value = private_key.reveal()
+    return private_key if value.endswith("\n") else Secret(value + "\n")
 
 
 def _one_public_key(output: str) -> str:

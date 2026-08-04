@@ -285,6 +285,33 @@ class EphemeralAgentTests(unittest.TestCase):
         self.assertEqual(PUBLIC_KEY.rstrip("\n"), fake_process.calls[3]["input"])
         self.assertEqual(("/usr/bin/ssh-agent", "-k"), fake_process.calls[-1]["argv"])
 
+    def test_identity_appends_only_a_missing_terminal_newline_before_ssh_add(self) -> None:
+        missing_newline = PRIVATE_KEY.rstrip("\n")
+        fake_process = FakeProcess(agent_responses())
+        agent = EphemeralAgent(FakeConnect(missing_newline), Runner(fake_process))
+
+        with agent.identity("item-id", "private_key", FINGERPRINT):
+            pass
+
+        self.assertEqual(PRIVATE_KEY, fake_process.calls[1]["input"])
+        self.assertNotIn(missing_newline, str(fake_process.calls[1]["argv"]))
+
+    def test_missing_terminal_newline_ssh_add_failure_stays_redacted_and_cleans_up(self) -> None:
+        missing_newline = PRIVATE_KEY.rstrip("\n")
+        responses = agent_responses()
+        responses[1] = completed(("/usr/bin/ssh-add", "-"), returncode=1)
+        responses = [responses[0], responses[1], responses[-1]]
+        fake_process = FakeProcess(responses)
+
+        with self.assertRaises(AgentError) as caught:
+            with EphemeralAgent(FakeConnect(missing_newline), Runner(fake_process)).identity(
+                "item-id", "private_key", FINGERPRINT
+            ):
+                self.fail("failed ssh-add must not yield an identity")
+
+        self.assertNotIn(missing_newline, str(caught.exception))
+        self.assertEqual(("/usr/bin/ssh-agent", "-k"), fake_process.calls[-1]["argv"])
+
     def test_identity_rejects_a_fingerprint_mismatch_without_exposing_the_private_key(self) -> None:
         fake_process = FakeProcess(agent_responses(fingerprint="SHA256:wrong-key"))
         agent = EphemeralAgent(FakeConnect(), Runner(fake_process))
