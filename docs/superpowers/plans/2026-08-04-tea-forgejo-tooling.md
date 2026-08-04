@@ -14,7 +14,7 @@
 - The token is read from Connect item `yznfzgoql7jl4oa6spa7vm3644`, field `api_token`, and is never placed in argv, output, diagnostics, or the caller environment.
 - General Tea commands may target arbitrary repository slugs on the pinned Forgejo server.
 - Homelab policy commands are pinned to the exact values in `/Users/clay/Code/homelab/infra/config/mac-agent/credential-map.json`.
-- No command may merge, approve a PR, approve a production environment, manage Forgejo secrets, or mutate a host directly.
+- The policy helper may not merge, approve a PR, approve a production environment, manage Forgejo secrets, or mutate a host directly. General Tea remains account-authorized and is intentionally not a policy sandbox.
 - Use TDD and preserve all existing 120 passing tests.
 
 ---
@@ -114,7 +114,47 @@ git add dot_local/bin/executable_homelab-agent-tea dot_local/lib/homelab_agent t
 git commit -m "feat: add ephemeral Tea credential adapter"
 ```
 
-### Task 3: Add homelab-specific checks and deploy policy
+### Task 3: Support the staged version-1 to version-2 map rollout
+
+**Files:**
+- Modify: `dot_local/lib/homelab_agent/models.py`
+- Modify: `dot_local/lib/homelab_agent/config.py`
+- Modify: `tests/test_homelab_agent_config.py`
+- Modify: `tests/test_homelab_agent_tea.py`
+
+**Interfaces:**
+- Consumes: the legacy onboarding version-1 map and the Tea policy version-2 map.
+- Produces: existing commands that work with either map and Tea commands that fail closed with a public upgrade message until version 2 is installed.
+
+- [ ] **Step 1: Write failing transition tests**
+
+Use the exact pre-Tea version-1 map shape and prove `doctor`, Git, SSH, and OP
+configuration still loads. Prove Tea setup stops before Keychain/Connect with
+`Tea workflow policy requires credential map version 2`. Keep all exact-key
+and pin tests for version 2.
+
+- [ ] **Step 2: Run focused tests and confirm RED**
+
+Run:
+
+```bash
+/opt/homebrew/bin/python3.12 -m unittest tests.test_homelab_agent_config tests.test_homelab_agent_tea -v
+```
+
+- [ ] **Step 3: Implement the compatibility window**
+
+Parse version 1 with its original exact top-level, Forgejo, and tool keys.
+Represent API identity and automation policy as unavailable for that version.
+Parse version 2 with the new exact fields and pins. Existing non-Tea commands
+may use either. Tea and Forgejo policy commands require version 2 before any
+secret access. Do not infer API fields or automation defaults into version 1.
+
+- [ ] **Step 4: Run focused tests and commit**
+
+Run the Step 2 command, then commit as
+`fix: support staged Tea policy rollout`.
+
+### Task 4: Add homelab-specific checks and deploy policy
 
 **Files:**
 - Create: `dot_local/lib/homelab_agent/forgejo_policy.py`
