@@ -164,6 +164,80 @@ class EphemeralAgentTests(unittest.TestCase):
 
 
 class PinnedForgejoSshTests(unittest.TestCase):
+    def test_separated_hostname_option_stops_before_starting_an_agent_or_ssh(self) -> None:
+        fake_process = FakeProcess([])
+        ssh_calls: list[tuple[str, ...]] = []
+
+        with self.assertRaisesRegex(AgentError, "SSH destination does not match configured identity"):
+            run_pinned_ssh(
+                identity(),
+                ["-o", "hOsTnAmE other.example", "git@git.4406.madtown.cloud", "git-upload-pack 'homelab/infra.git'"],
+                agent=EphemeralAgent(FakeConnect(), Runner(fake_process)),
+                ssh_executor=lambda argv: ssh_calls.append(argv),  # type: ignore[return-value]
+            )
+
+        self.assertEqual([], fake_process.calls)
+        self.assertEqual([], ssh_calls)
+
+    def test_separated_user_option_stops_before_starting_an_agent_or_ssh(self) -> None:
+        fake_process = FakeProcess([])
+        ssh_calls: list[tuple[str, ...]] = []
+
+        with self.assertRaisesRegex(AgentError, "SSH destination does not match configured identity"):
+            run_pinned_ssh(
+                identity(),
+                ["-o", "User otheruser", "git@git.4406.madtown.cloud", "git-upload-pack 'homelab/infra.git'"],
+                agent=EphemeralAgent(FakeConnect(), Runner(fake_process)),
+                ssh_executor=lambda argv: ssh_calls.append(argv),  # type: ignore[return-value]
+            )
+
+        self.assertEqual([], fake_process.calls)
+        self.assertEqual([], ssh_calls)
+
+    def test_pinned_security_option_overrides_stop_before_starting_an_agent_or_ssh(self) -> None:
+        overrides = {
+            "attached identity agent": ["-oiDeNtItYaGeNt=/tmp/other-agent.sock"],
+            "separate identity file": ["-o", "IdentityFile=/tmp/other-key"],
+            "space identities only": ["-o", "IdentitiesOnly yes"],
+            "attached strict host checking": ["-oStrictHostKeyChecking=no"],
+            "space user known hosts": ["-o", "UserKnownHostsFile /tmp/other-known-hosts"],
+        }
+        for name, options in overrides.items():
+            with self.subTest(name=name):
+                fake_process = FakeProcess([])
+                ssh_calls: list[tuple[str, ...]] = []
+
+                with self.assertRaisesRegex(AgentError, "SSH invocation overrides pinned security settings"):
+                    run_pinned_ssh(
+                        identity(),
+                        [*options, "git@git.4406.madtown.cloud", "git-upload-pack 'homelab/infra.git'"],
+                        agent=EphemeralAgent(FakeConnect(), Runner(fake_process)),
+                        ssh_executor=lambda argv: ssh_calls.append(argv),  # type: ignore[return-value]
+                    )
+
+                self.assertEqual([], fake_process.calls)
+                self.assertEqual([], ssh_calls)
+
+    def test_login_and_port_overrides_stop_before_starting_an_agent_or_ssh(self) -> None:
+        overrides = {
+            "separate login": ["-l", "otheruser"],
+            "attached login": ["-lotheruser"],
+            "separate port": ["-p", "2200"],
+            "attached port": ["-p2200"],
+        }
+        for name, options in overrides.items():
+            with self.subTest(name=name):
+                fake_process = FakeProcess([])
+
+                with self.assertRaisesRegex(AgentError, "SSH destination does not match configured identity"):
+                    run_pinned_ssh(
+                        identity(),
+                        [*options, "git@git.4406.madtown.cloud", "git-upload-pack 'homelab/infra.git'"],
+                        agent=EphemeralAgent(FakeConnect(), Runner(fake_process)),
+                    )
+
+                self.assertEqual([], fake_process.calls)
+
     def test_wrong_destination_user_stops_before_starting_an_agent_or_ssh(self) -> None:
         fake_process = FakeProcess([])
         ssh_calls: list[tuple[str, ...]] = []
@@ -199,7 +273,13 @@ class PinnedForgejoSshTests(unittest.TestCase):
         observed: dict[str, object] = {}
         git_args = [
             "-o",
+            "SendEnv GIT_PROTOCOL",
+            "-o",
             "SendEnv=GIT_PROTOCOL",
+            "-oSendEnv=GIT_PROTOCOL",
+            "-l",
+            "git",
+            "-p2222",
             "-vv",
             "git@git.4406.madtown.cloud",
             "git-upload-pack 'homelab/infra.git'",

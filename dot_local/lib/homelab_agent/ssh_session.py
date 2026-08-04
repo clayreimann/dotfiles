@@ -30,6 +30,16 @@ _OPTIONS_WITH_ARGUMENT = frozenset(
     {"-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w"}
 )
 _FLAG_OPTIONS = frozenset({"-4", "-6", "-A", "-a", "-C", "-f", "-G", "-g", "-K", "-k", "-M", "-N", "-n", "-q", "-s", "-T", "-t", "-V", "-X", "-x", "-y"})
+_PINNED_SECURITY_OPTIONS = frozenset(
+    {
+        "identityagent",
+        "identityfile",
+        "identitiesonly",
+        "stricthostkeychecking",
+        "userknownhostsfile",
+        "globalknownhostsfile",
+    }
+)
 SshExecutor = Callable[..., subprocess.CompletedProcess[str]]
 
 
@@ -193,16 +203,33 @@ def _validate_destination_option(identity: SshIdentity, option: str, value: str)
         raise AgentError("SSH invocation contains an unsupported option")
     if option != "-o":
         return
-    name, separator, option_value = value.partition("=")
-    if not separator:
-        return
+    name, option_value = _ssh_option(value)
+    if name in _PINNED_SECURITY_OPTIONS:
+        raise AgentError("SSH invocation overrides pinned security settings")
     expected = {
         "user": identity.user,
         "hostname": identity.host,
         "port": str(identity.port),
-    }.get(name.casefold())
+    }.get(name)
     if expected is not None and option_value != expected:
         raise AgentError("SSH destination does not match configured identity")
+
+
+def _ssh_option(value: str) -> tuple[str, str]:
+    """Parse OpenSSH's ``Key=value`` and ``Key value`` command-line forms."""
+    text = value.strip()
+    if "=" in text:
+        name, option_value = text.split("=", 1)
+    else:
+        parts = text.split(maxsplit=1)
+        if len(parts) != 2:
+            raise AgentError("SSH invocation contains an invalid option")
+        name, option_value = parts
+    name = name.strip().casefold()
+    option_value = option_value.strip()
+    if not name or not option_value:
+        raise AgentError("SSH invocation contains an invalid option")
+    return name, option_value
 
 
 def run_pinned_ssh(
