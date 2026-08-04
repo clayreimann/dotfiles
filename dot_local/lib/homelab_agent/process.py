@@ -34,6 +34,7 @@ class ProcessSpec:
     argv: tuple[str, ...]
     stdin: Secret | str | None = None
     env_overlay: Mapping[str, str] = field(default_factory=dict)
+    unset_env: tuple[str, ...] = ()
     pass_fds: tuple[int, ...] = ()
     display_name: str = "child process"
 
@@ -50,6 +51,8 @@ class Runner:
     def run(self, spec: ProcessSpec) -> subprocess.CompletedProcess[str]:
         stdin = spec.stdin.reveal() if isinstance(spec.stdin, Secret) else spec.stdin
         environment = os.environ.copy()
+        for name in spec.unset_env:
+            environment.pop(name, None)
         environment.update(spec.env_overlay)
         try:
             completed = self._executor(

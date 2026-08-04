@@ -82,21 +82,45 @@ def agent_responses(*, fingerprint: str = FINGERPRINT) -> list[subprocess.Comple
 
 
 class EphemeralAgentTests(unittest.TestCase):
-    def test_identity_attempts_agent_cleanup_when_startup_output_is_invalid(self) -> None:
+    def test_identity_does_not_clean_up_when_startup_output_is_invalid(self) -> None:
         fake_process = FakeProcess(
             [
                 completed(("/usr/bin/ssh-agent", "-s"), "not an ssh-agent environment\n"),
-                completed(("/usr/bin/ssh-agent", "-k")),
             ]
         )
 
-        with self.assertRaisesRegex(AgentError, "temporary SSH agent returned invalid environment"):
+        with patch.dict(
+            os.environ,
+            {"SSH_AUTH_SOCK": "/tmp/caller-agent.sock", "SSH_AGENT_PID": "999"},
+        ):
+            with self.assertRaisesRegex(AgentError, "temporary SSH agent returned invalid environment"):
+                with EphemeralAgent(FakeConnect(), Runner(fake_process)).identity(
+                    "item-id", "private_key", FINGERPRINT
+                ):
+                    self.fail("invalid agent output must not yield a usable agent")
+
+        self.assertEqual(1, len(fake_process.calls))
+        self.assertEqual(("/usr/bin/ssh-agent", "-s"), fake_process.calls[0]["argv"])
+        self.assertNotIn("SSH_AUTH_SOCK", fake_process.calls[0]["env"])
+        self.assertNotIn("SSH_AGENT_PID", fake_process.calls[0]["env"])
+
+    def test_identity_scrubs_caller_agent_environment_from_every_agent_child(self) -> None:
+        fake_process = FakeProcess(agent_responses())
+
+        with patch.dict(
+            os.environ,
+            {"SSH_AUTH_SOCK": "/tmp/caller-agent.sock", "SSH_AGENT_PID": "999"},
+        ):
             with EphemeralAgent(FakeConnect(), Runner(fake_process)).identity(
                 "item-id", "private_key", FINGERPRINT
             ):
-                self.fail("invalid agent output must not yield a usable agent")
+                pass
 
-        self.assertEqual(("/usr/bin/ssh-agent", "-k"), fake_process.calls[-1]["argv"])
+        self.assertNotIn("SSH_AUTH_SOCK", fake_process.calls[0]["env"])
+        self.assertNotIn("SSH_AGENT_PID", fake_process.calls[0]["env"])
+        for call in fake_process.calls[1:]:
+            self.assertEqual("/private/tmp/agent.sock", call["env"]["SSH_AUTH_SOCK"])
+            self.assertEqual("4242", call["env"]["SSH_AGENT_PID"])
 
     def test_identity_loads_raw_multiline_key_and_verifies_the_only_public_key(self) -> None:
         fake_process = FakeProcess(agent_responses())
@@ -140,9 +164,46 @@ class EphemeralAgentTests(unittest.TestCase):
 
 
 class PinnedForgejoSshTests(unittest.TestCase):
+    def test_wrong_destination_user_stops_before_starting_an_agent_or_ssh(self) -> None:
+        fake_process = FakeProcess([])
+        ssh_calls: list[tuple[str, ...]] = []
+
+        with self.assertRaisesRegex(AgentError, "SSH destination does not match configured identity"):
+            run_pinned_ssh(
+                identity(),
+                ["otheruser@git.4406.madtown.cloud", "git-upload-pack 'homelab/infra.git'"],
+                agent=EphemeralAgent(FakeConnect(), Runner(fake_process)),
+                ssh_executor=lambda argv: ssh_calls.append(argv),  # type: ignore[return-value]
+            )
+
+        self.assertEqual([], fake_process.calls)
+        self.assertEqual([], ssh_calls)
+
+    def test_wrong_destination_host_stops_before_starting_an_agent_or_ssh(self) -> None:
+        fake_process = FakeProcess([])
+        ssh_calls: list[tuple[str, ...]] = []
+
+        with self.assertRaisesRegex(AgentError, "SSH destination does not match configured identity"):
+            run_pinned_ssh(
+                identity(),
+                ["git@other.example", "git-upload-pack 'homelab/infra.git'"],
+                agent=EphemeralAgent(FakeConnect(), Runner(fake_process)),
+                ssh_executor=lambda argv: ssh_calls.append(argv),  # type: ignore[return-value]
+            )
+
+        self.assertEqual([], fake_process.calls)
+        self.assertEqual([], ssh_calls)
+
     def test_loaded_agent_key_is_actually_offered(self) -> None:
         fake_process = FakeProcess(agent_responses())
         observed: dict[str, object] = {}
+        git_args = [
+            "-o",
+            "SendEnv=GIT_PROTOCOL",
+            "-vv",
+            "git@git.4406.madtown.cloud",
+            "git-upload-pack 'homelab/infra.git'",
+        ]
 
         def ssh_executor(argv: tuple[str, ...], **kwargs: Any) -> subprocess.CompletedProcess[str]:
             observed["argv"] = argv
@@ -153,7 +214,7 @@ class PinnedForgejoSshTests(unittest.TestCase):
 
         rc = run_pinned_ssh(
             identity(),
-            ["git@git.4406.madtown.cloud", "git-upload-pack 'homelab/infra.git'"],
+            git_args,
             agent=EphemeralAgent(FakeConnect(), Runner(fake_process)),
             ssh_executor=ssh_executor,
         )
@@ -169,8 +230,8 @@ class PinnedForgejoSshTests(unittest.TestCase):
         self.assertEqual("2222", argv[argv.index("-p") + 1])
         self.assertEqual("/dev/null", argv[argv.index("-F") + 1])
         self.assertEqual(
-            ["git@git.4406.madtown.cloud", "git-upload-pack 'homelab/infra.git'"],
-            list(argv[-2:]),
+            git_args,
+            list(argv[-len(git_args):]),
         )
         self.assertEqual(identity().known_host + "\n", observed["known_hosts"])
         self.assertEqual(0o600, observed["known_hosts_mode"])

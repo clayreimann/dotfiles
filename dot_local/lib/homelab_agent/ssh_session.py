@@ -25,6 +25,11 @@ class AgentSocket:
 
 
 _AGENT_ASSIGNMENT = re.compile(r"^(SSH_AUTH_SOCK|SSH_AGENT_PID)=([^;]+);")
+_AGENT_ENVIRONMENT_NAMES = ("SSH_AUTH_SOCK", "SSH_AGENT_PID")
+_OPTIONS_WITH_ARGUMENT = frozenset(
+    {"-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w"}
+)
+_FLAG_OPTIONS = frozenset({"-4", "-6", "-A", "-a", "-C", "-f", "-G", "-g", "-K", "-k", "-M", "-N", "-n", "-q", "-s", "-T", "-t", "-V", "-X", "-x", "-y"})
 SshExecutor = Callable[..., subprocess.CompletedProcess[str]]
 
 
@@ -43,11 +48,13 @@ class EphemeralAgent:
         started = self._runner.run(
             ProcessSpec(
                 argv=("/usr/bin/ssh-agent", "-s"),
+                unset_env=_AGENT_ENVIRONMENT_NAMES,
                 display_name="temporary SSH agent startup",
             )
         )
         agent_environment: dict[str, str] = {}
         private_key: Secret | None = None
+        socket: AgentSocket | None = None
         try:
             socket = _agent_socket(started.stdout)
             agent_environment = {
@@ -60,6 +67,7 @@ class EphemeralAgent:
                     argv=("/usr/bin/ssh-add", "-"),
                     stdin=private_key,
                     env_overlay=agent_environment,
+                    unset_env=_AGENT_ENVIRONMENT_NAMES,
                     display_name="temporary SSH key load",
                 )
             )
@@ -67,6 +75,7 @@ class EphemeralAgent:
                 ProcessSpec(
                     argv=("/usr/bin/ssh-add", "-L"),
                     env_overlay=agent_environment,
+                    unset_env=_AGENT_ENVIRONMENT_NAMES,
                     display_name="temporary SSH public-key listing",
                 )
             )
@@ -76,6 +85,7 @@ class EphemeralAgent:
                     argv=("/usr/bin/ssh-keygen", "-lf", "-", "-E", "sha256"),
                     stdin=public_key,
                     env_overlay=agent_environment,
+                    unset_env=_AGENT_ENVIRONMENT_NAMES,
                     display_name="temporary SSH key verification",
                 )
             )
@@ -85,17 +95,19 @@ class EphemeralAgent:
         finally:
             private_key = None
             prior_error = sys.exc_info()[0] is not None
-            try:
-                self._runner.run(
-                    ProcessSpec(
-                        argv=("/usr/bin/ssh-agent", "-k"),
-                        env_overlay=agent_environment,
-                        display_name="temporary SSH agent cleanup",
+            if socket is not None:
+                try:
+                    self._runner.run(
+                        ProcessSpec(
+                            argv=("/usr/bin/ssh-agent", "-k"),
+                            env_overlay=agent_environment,
+                            unset_env=_AGENT_ENVIRONMENT_NAMES,
+                            display_name="temporary SSH agent cleanup",
+                        )
                     )
-                )
-            except AgentError:
-                if not prior_error:
-                    raise
+                except AgentError:
+                    if not prior_error:
+                        raise
 
 
 def _agent_socket(output: str) -> AgentSocket:
@@ -136,6 +148,63 @@ def _fingerprint(output: str) -> str:
     return fields[1]
 
 
+def _validate_destination(identity: SshIdentity, remote_args: Sequence[str]) -> None:
+    """Fail closed unless Git's effective SSH destination is the pinned Forgejo user/host."""
+    index = 0
+    arguments = tuple(remote_args)
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--":
+            index += 1
+            break
+        if not argument.startswith("-") or argument == "-":
+            break
+        if argument in _OPTIONS_WITH_ARGUMENT:
+            if index + 1 >= len(arguments):
+                raise AgentError("SSH invocation is missing an option value")
+            _validate_destination_option(identity, argument, arguments[index + 1])
+            index += 2
+            continue
+        if len(argument) > 2 and argument[:2] in {"-l", "-p", "-o"}:
+            _validate_destination_option(identity, argument[:2], argument[2:])
+            index += 1
+            continue
+        if argument in _FLAG_OPTIONS or re.fullmatch(r"-v+", argument):
+            index += 1
+            continue
+        raise AgentError("SSH invocation contains an unsupported option")
+    if index >= len(arguments):
+        raise AgentError("SSH invocation is missing a destination")
+    user, separator, host = arguments[index].partition("@")
+    if separator != "@" or not user or not host or "@" in host:
+        raise AgentError("SSH destination does not match configured identity")
+    if user != identity.user or host != identity.host:
+        raise AgentError("SSH destination does not match configured identity")
+
+
+def _validate_destination_option(identity: SshIdentity, option: str, value: str) -> None:
+    if not value:
+        raise AgentError("SSH invocation is missing an option value")
+    if option == "-l" and value != identity.user:
+        raise AgentError("SSH destination does not match configured identity")
+    if option == "-p" and value != str(identity.port):
+        raise AgentError("SSH destination does not match configured identity")
+    if option == "-F":
+        raise AgentError("SSH invocation contains an unsupported option")
+    if option != "-o":
+        return
+    name, separator, option_value = value.partition("=")
+    if not separator:
+        return
+    expected = {
+        "user": identity.user,
+        "hostname": identity.host,
+        "port": str(identity.port),
+    }.get(name.casefold())
+    if expected is not None and option_value != expected:
+        raise AgentError("SSH destination does not match configured identity")
+
+
 def run_pinned_ssh(
     identity: SshIdentity,
     remote_args: Sequence[str],
@@ -150,6 +219,7 @@ def run_pinned_ssh(
     """
     if agent is None:
         raise AgentError("pinned SSH requires an ephemeral credential agent")
+    _validate_destination(identity, remote_args)
 
     known_hosts_fd, known_hosts_name = tempfile.mkstemp(prefix="homelab-agent-known-hosts-")
     known_hosts_path = Path(known_hosts_name)
