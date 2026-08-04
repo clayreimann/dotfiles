@@ -227,6 +227,8 @@ def _format_check(check: CheckResult) -> str:
         "exact field or fingerprint is invalid",
         "pinned host key is approved",
         "pinned host key is invalid",
+        "authentication was not attempted after host-trust failure",
+        "authentication was not attempted after credential validation failure",
         "pinned authentication succeeded",
         "pinned authentication was rejected",
         "repository wiring is approved",

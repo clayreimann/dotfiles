@@ -256,23 +256,35 @@ def run_doctor(
                     "pinned host key is approved" if host_ok else "pinned host key is invalid",
                 )
             )
-            try:
-                probe_status = (
-                    forgejo_probe(client, config.forgejo)
-                    if credential_ok and host_ok
-                    else 255
+            if not host_ok:
+                authorized = False
+                authorization_detail = (
+                    "authentication was not attempted after host-trust failure"
                 )
-            except (AgentError, OSError, ValueError):
-                probe_status = 255
-            # OpenSSH -T commonly exits 1 after a successful server-side no-shell
-            # response.  SSH authentication failures use the distinct 255 status.
-            authorized = probe_status in {0, 1}
+            elif not credential_ok:
+                authorized = False
+                authorization_detail = (
+                    "authentication was not attempted after credential validation failure"
+                )
+            else:
+                try:
+                    probe_status = forgejo_probe(client, config.forgejo)
+                except (AgentError, OSError, ValueError):
+                    probe_status = 255
+                # OpenSSH -T commonly exits 1 after a successful server-side no-shell
+                # response.  SSH authentication failures use distinct status 255.
+                authorized = probe_status in {0, 1}
+                authorization_detail = (
+                    "pinned authentication succeeded"
+                    if authorized
+                    else "pinned authentication was rejected"
+                )
             results.append(
                 _result(
                     "PASS" if authorized else "FAIL",
                     "server-authorization",
                     "Forgejo authentication",
-                    "pinned authentication succeeded" if authorized else "pinned authentication was rejected",
+                    authorization_detail,
                 )
             )
             for repository in config.repositories:

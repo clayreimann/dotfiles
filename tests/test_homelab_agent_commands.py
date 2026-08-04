@@ -812,6 +812,8 @@ class DoctorAndEnrollmentTests(unittest.TestCase):
         self.assertEqual("FAIL", host_check.status)
         self.assertEqual("FAIL", authorization.status)
         self.assertEqual([], probe_calls)
+        self.assertEqual("authentication was not attempted after host-trust failure", authorization.detail)
+        self.assertNotIn("rejected", authorization.detail)
 
     def test_presented_host_key_probe_compares_exact_pinned_public_line(self) -> None:
         from homelab_agent import doctor
