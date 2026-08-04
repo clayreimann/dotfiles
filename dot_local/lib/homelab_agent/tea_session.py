@@ -180,6 +180,8 @@ def run_tea(
 ) -> int:
     """Authenticate a temporary Tea session and forward the caller's exit code."""
     config = load()
+    if getattr(config, "version", None) != 2:
+        raise AgentError("Tea workflow policy requires credential map version 2")
     if client is not None:
         with TeaSession(config.forgejo, client, executor=executor, environ=environ) as session:
             return session.run(arguments, output=output, error_output=error_output)

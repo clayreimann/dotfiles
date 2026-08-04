@@ -17,9 +17,9 @@ from homelab_agent.config import ConfigError, load_config
 
 
 def valid_document() -> dict[str, object]:
-    """Return a complete, non-secret version-1 public credential map."""
+    """Return a complete, non-secret version-2 public credential map."""
     return {
-        "version": 1,
+        "version": 2,
         "vault": {"name": "Homelab Secrets"},
         "connect": {
             "direct_url": "http://192.168.42.253:8080",
@@ -87,6 +87,21 @@ def valid_document() -> dict[str, object]:
     }
 
 
+def legacy_document() -> dict[str, object]:
+    """Return the exact pre-Tea version-1 public credential-map shape."""
+    document = valid_document()
+    document["version"] = 1
+    forgejo = document["forgejo"]
+    assert isinstance(forgejo, dict)
+    for field in ("api_url", "api_user", "api_token_field"):
+        del forgejo[field]
+    del document["forgejo_automation"]
+    tools = document["tools"]
+    assert isinstance(tools, dict)
+    del tools["tea"]
+    return document
+
+
 class LoadConfigTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -122,6 +137,32 @@ class LoadConfigTests(unittest.TestCase):
         self.assertEqual("0.14", config.tools["tea"])
         self.assertEqual("docker01", config.target("docker01").alias)
         self.assertEqual(Path("/Users/clay/Code/homelab/infra"), config.repositories[0].path)
+
+    def test_load_config_accepts_the_pre_tea_map_without_inventing_tea_policy(self) -> None:
+        document = legacy_document()
+        config = load_config(self.write_config(document))
+
+        self.assertEqual(
+            {
+                "version",
+                "vault",
+                "connect",
+                "keychain",
+                "forgejo",
+                "bastion",
+                "targets",
+                "repositories",
+                "tools",
+            },
+            set(document),
+        )
+        self.assertEqual(1, config.version)
+        self.assertEqual("git.4406.madtown.cloud", config.forgejo.host)
+        self.assertFalse(hasattr(config.forgejo, "api_url"))
+        self.assertIsNone(config.forgejo_automation)
+        self.assertNotIn("tea", config.tools)
+        self.assertEqual("docker01", config.target("docker01").alias)
+        self.assertEqual("infra", config.repositories[0].name)
 
     def test_load_config_ignores_ambient_environment_override_when_path_is_omitted(self) -> None:
         approved_path = self.write_config(valid_document())
@@ -243,11 +284,13 @@ class LoadConfigTests(unittest.TestCase):
             load_config(self.write_config(document))
 
     def test_load_config_rejects_unknown_version(self) -> None:
-        document = valid_document()
-        document["version"] = 2
+        for version in (3, True, "2"):
+            with self.subTest(version=version):
+                document = valid_document()
+                document["version"] = version
 
-        with self.assertRaisesRegex(ConfigError, "unsupported config version"):
-            load_config(self.write_config(document))
+                with self.assertRaisesRegex(ConfigError, "unsupported config version"):
+                    load_config(self.write_config(document))
 
     def test_load_config_rejects_unknown_document_key(self) -> None:
         document = valid_document()

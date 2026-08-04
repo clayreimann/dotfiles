@@ -59,6 +59,7 @@ def completed(
 
 def config(api_user: str = "claude") -> SimpleNamespace:
     return SimpleNamespace(
+        version=2,
         forgejo=SimpleNamespace(
             api_url="https://git.4406.madtown.cloud",
             api_user=api_user,
@@ -178,6 +179,26 @@ class TeaSessionTests(unittest.TestCase):
 
         self.assertEqual([], client.calls)
         self.assertEqual(1, len(executor.calls))
+
+    def test_rejects_a_legacy_credential_map_before_keychain_or_connect_access(self) -> None:
+        from homelab_agent.process import AgentError
+        from homelab_agent.tea_session import run_tea
+
+        def unexpected_keychain():
+            self.fail("legacy Tea policy must not read Keychain")
+
+        def unexpected_route(**_kwargs: Any):
+            self.fail("legacy Tea policy must not open Connect")
+
+        with self.assertRaisesRegex(
+            AgentError, "Tea workflow policy requires credential map version 2"
+        ):
+            run_tea(
+                ["issues", "list"],
+                load=lambda: SimpleNamespace(version=1),
+                keychain_factory=unexpected_keychain,
+                route_factory=unexpected_route,
+            )
 
     def test_accepts_the_installed_tea_version_format_with_terminal_color_escapes(self) -> None:
         try:

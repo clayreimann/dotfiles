@@ -37,6 +37,15 @@ _APPROVED_FORGEJO = {
     "api_user": "claude",
     "api_token_field": "api_token",
 }
+_APPROVED_FORGEJO_SSH = {
+    "host": "git.4406.madtown.cloud",
+    "port": 2222,
+    "user": "git",
+    "credential_item_id": "yznfzgoql7jl4oa6spa7vm3644",
+    "private_field": "private_key",
+    "expected_fingerprint": "SHA256:hK4mZs4YQvDEf1zgeAOKtER0+eIdPJsDxRzPHlpXpjA",
+    "known_host": "[git.4406.madtown.cloud]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGyB56wKbde2dOT+puZOfjpWqTNx3sIDkEjoN1wvUTyT",
+}
 _APPROVED_FORGEJO_AUTOMATION = {
     "repository": "homelab/infra",
     "required_workflows": (
@@ -52,20 +61,20 @@ _APPROVED_FORGEJO_AUTOMATION = {
 }
 _APPROVED_TEA_VERSION = "0.14"
 _FORBIDDEN_SECRET_KEYS = frozenset({"token", "password", "passphrase", "private_key"})
-_DOCUMENT_KEYS = frozenset(
+_LEGACY_DOCUMENT_KEYS = frozenset(
     {
         "version",
         "vault",
         "connect",
         "keychain",
         "forgejo",
-        "forgejo_automation",
         "bastion",
         "targets",
         "repositories",
         "tools",
     }
 )
+_VERSION_2_DOCUMENT_KEYS = _LEGACY_DOCUMENT_KEYS | {"forgejo_automation"}
 _IDENTITY_KEYS = frozenset(
     {
         "host",
@@ -84,7 +93,8 @@ _FORGEJO_AUTOMATION_KEYS = frozenset(
 _TARGET_KEYS = _IDENTITY_KEYS | {"alias", "route"}
 _BASTION_KEYS = frozenset({"host", "port", "user", "encrypted_key_path", "known_host"})
 _REPOSITORY_KEYS = frozenset({"name", "remote", "path"})
-_TOOL_KEYS = frozenset({"python", "git", "op", "tofu", "ansible", "tailscale", "tea"})
+_LEGACY_TOOL_KEYS = frozenset({"python", "git", "op", "tofu", "ansible", "tailscale"})
+_VERSION_2_TOOL_KEYS = _LEGACY_TOOL_KEYS | {"tea"}
 
 
 class ConfigError(ValueError):
@@ -174,8 +184,13 @@ def _forgejo_identity(value: object) -> ForgejoIdentity:
     )
 
 
-def _validate_forgejo_pins(identity: ForgejoIdentity) -> None:
-    for field, expected in _APPROVED_FORGEJO.items():
+def _validate_forgejo_pins(identity: SshIdentity | ForgejoIdentity) -> None:
+    approved = (
+        _APPROVED_FORGEJO
+        if isinstance(identity, ForgejoIdentity)
+        else _APPROVED_FORGEJO_SSH
+    )
+    for field, expected in approved.items():
         if getattr(identity, field) != expected:
             raise ConfigError(f"forgejo.{field} must match the approved value")
 
@@ -277,23 +292,29 @@ def _repositories(value: object) -> tuple[Repository, ...]:
     return tuple(repositories)
 
 
-def _tools(value: object) -> Mapping[str, str]:
-    fields = _object(value, "tools", _TOOL_KEYS)
+def _tools(value: object, version: int) -> Mapping[str, str]:
+    keys = _VERSION_2_TOOL_KEYS if version == 2 else _LEGACY_TOOL_KEYS
+    fields = _object(value, "tools", keys)
     tools = MappingProxyType(
-        {name: _string(fields[name], f"tools.{name}") for name in _TOOL_KEYS}
+        {name: _string(fields[name], f"tools.{name}") for name in keys}
     )
-    if tools["tea"] != _APPROVED_TEA_VERSION:
+    if version == 2 and tools["tea"] != _APPROVED_TEA_VERSION:
         raise ConfigError("tools.tea must match the approved value")
     return tools
 
 
 def load_config(path: Path | None = None) -> AgentConfig:
-    """Load a strict, non-secret version-1 map into immutable runtime models."""
+    """Load a strict, non-secret version-1 or version-2 credential map."""
     document = _read_document(_config_path(path))
     _reject_secret_keys(document)
-    fields = _object(document, "document", _DOCUMENT_KEYS)
-    if fields["version"] != 1:
+    version = document.get("version")
+    if not isinstance(version, int) or isinstance(version, bool) or version not in {1, 2}:
         raise ConfigError("unsupported config version")
+    fields = _object(
+        document,
+        "document",
+        _VERSION_2_DOCUMENT_KEYS if version == 2 else _LEGACY_DOCUMENT_KEYS,
+    )
 
     vault = _object(fields["vault"], "vault", frozenset({"name"}))
     connect = _object(fields["connect"], "connect", frozenset({"direct_url", "tunnel_url"}))
@@ -323,19 +344,28 @@ def load_config(path: Path | None = None) -> AgentConfig:
     if bastion_keychain_service != _APPROVED_BASTION_KEYCHAIN_SERVICE:
         raise ConfigError("keychain.bastion_service must match the approved value")
 
-    forgejo = _forgejo_identity(fields["forgejo"])
+    forgejo = (
+        _forgejo_identity(fields["forgejo"])
+        if version == 2
+        else _identity(fields["forgejo"], "forgejo")
+    )
     _validate_forgejo_pins(forgejo)
 
     return AgentConfig(
+        version=version,
         vault_name=vault_name,
         direct_connect_url=direct_connect_url,
         tunnel_connect_url=tunnel_connect_url,
         connect_keychain_service=connect_keychain_service,
         bastion_keychain_service=bastion_keychain_service,
         forgejo=forgejo,
-        forgejo_automation=_forgejo_automation(fields["forgejo_automation"]),
+        forgejo_automation=(
+            _forgejo_automation(fields["forgejo_automation"])
+            if version == 2
+            else None
+        ),
         bastion=_bastion(fields["bastion"]),
         targets=_targets(fields["targets"]),
         repositories=_repositories(fields["repositories"]),
-        tools=_tools(fields["tools"]),
+        tools=_tools(fields["tools"], version),
     )

@@ -57,13 +57,14 @@ class Repository:
 
 @dataclass(frozen=True)
 class AgentConfig:
+    version: Literal[1, 2]
     vault_name: str
     direct_connect_url: str
     tunnel_connect_url: str
     connect_keychain_service: str
     bastion_keychain_service: str
-    forgejo: ForgejoIdentity
-    forgejo_automation: ForgejoAutomation
+    forgejo: SshIdentity | ForgejoIdentity
+    forgejo_automation: ForgejoAutomation | None
     bastion: Bastion | None
     targets: Mapping[str, ManagedTarget]
     repositories: tuple[Repository, ...]
