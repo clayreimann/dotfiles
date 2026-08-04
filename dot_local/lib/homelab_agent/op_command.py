@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from collections.abc import Callable, Sequence
-from typing import Any, TextIO
+from typing import Any, Mapping, TextIO
 
 from .config import load_config
 from .keychain import Keychain
@@ -14,7 +15,16 @@ from .ssh_session import ConnectRoute
 
 _OP_PATH = "/opt/homebrew/bin/op"
 _VAULT_NAME = "Homelab Secrets"
-_CONNECT_ENVIRONMENT = ("OP_CONNECT_HOST", "OP_CONNECT_TOKEN")
+_LOCAL_OP_ENVIRONMENT = frozenset(
+    {
+        "OP_ACCOUNT",
+        "OP_CONFIG_DIR",
+        "OP_CONNECT_HOST",
+        "OP_CONNECT_TOKEN",
+        "OP_SERVICE_ACCOUNT_TOKEN",
+        "OP_SESSION",
+    }
+)
 
 
 class UsageError(AgentError):
@@ -25,96 +35,55 @@ def _usage(message: str) -> UsageError:
     return UsageError(message)
 
 
-def _has_option(arguments: Sequence[str], name: str) -> bool:
-    return any(argument == name or argument.startswith(f"{name}=") for argument in arguments)
-
-
-def _vault_value(arguments: Sequence[str]) -> str | None:
-    values: list[str] = []
-    index = 0
-    while index < len(arguments):
-        argument = arguments[index]
-        if argument == "--vault":
-            if index + 1 >= len(arguments):
-                raise _usage("--vault requires Homelab Secrets")
-            values.append(arguments[index + 1])
-            index += 2
-            continue
-        if argument.startswith("--vault="):
-            values.append(argument.removeprefix("--vault="))
-        index += 1
-    if not values:
-        return None
-    if any(value != _VAULT_NAME for value in values):
-        raise _usage("only the Homelab Secrets vault is supported")
-    return _VAULT_NAME
-
-
-def _reject_unsafe_arguments(arguments: Sequence[str]) -> None:
-    if not arguments or any(not argument for argument in arguments):
-        raise _usage("operation is not supported")
-    if any("=" in argument and not argument.startswith("--vault=") for argument in arguments):
-        raise _usage("assignment statements are not supported")
-    for option in ("--template", "--reveal", "--connect-host", "--connect-token"):
-        if _has_option(arguments, option):
-            raise _usage(f"{option} is not supported")
-    _vault_value(arguments)
-
-
-def _without_vault(arguments: Sequence[str]) -> tuple[str, ...]:
-    result: list[str] = []
-    index = 0
-    while index < len(arguments):
-        argument = arguments[index]
-        if argument == "--vault":
-            index += 2
-            continue
-        if argument.startswith("--vault="):
-            index += 1
-            continue
-        result.append(argument)
-        index += 1
-    return tuple(result)
+def _valid_item_uuid(value: str) -> bool:
+    return (
+        len(value) == 26
+        and value.isascii()
+        and value.isalnum()
+        and value == value.lower()
+    )
 
 
 def validate_op_argv(argv: Sequence[str]) -> tuple[str, ...]:
     """Return a public, vault-pinned `op` command or reject it before Keychain."""
     arguments = tuple(argv)
-    if len(arguments) >= 2 and arguments[:2] == ("item", "create") and (
-        len(arguments) < 3 or arguments[2] != "-"
-    ):
-        raise _usage("item create requires JSON on stdin with item create -")
-    _reject_unsafe_arguments(arguments)
-    command = _without_vault(arguments)
-
-    if command[0] == "read":
-        if len(command) < 2 or not command[1].startswith(f"op://{_VAULT_NAME}/"):
-            raise _usage("only the Homelab Secrets vault is supported")
-        return command
-    elif command[0] == "vault":
-        if len(command) < 2 or command[1] not in {"list", "get"}:
-            raise _usage("operation is not supported")
-        if command[1] == "get" and (len(command) < 3 or command[2] != _VAULT_NAME):
-            raise _usage("only the Homelab Secrets vault is supported")
-        return command
-    elif command[0] == "item":
-        if len(command) < 2 or command[1] not in {"list", "get", "create", "edit"}:
-            raise _usage("operation is not supported")
-        if command[1] == "create" and (len(command) < 3 or command[2] != "-"):
-            raise _usage("item create requires JSON on stdin with item create -")
-        if command[1] == "edit":
-            if (
-                len(command) < 3
-                or len(command[2]) != 26
-                or not command[2].isascii()
-                or not command[2].isalnum()
-                or command[2] != command[2].lower()
-            ):
-                raise _usage("item edit requires a 26-character item UUID")
-    else:
+    if not arguments or any(not argument for argument in arguments):
         raise _usage("operation is not supported")
+    if any(argument.endswith("[delete]") for argument in arguments):
+        raise _usage("field deletion is not supported")
 
-    return (*command, "--vault", _VAULT_NAME)
+    if arguments[:2] == ("item", "create"):
+        if len(arguments) < 3 or arguments[2] != "-":
+            raise _usage("item create requires JSON on stdin with item create -")
+        if arguments != ("item", "create", "-"):
+            raise _usage("item create requires the exact stdin-only form: item create -")
+        return (*arguments, "--vault", _VAULT_NAME)
+
+    if arguments[:2] == ("item", "edit"):
+        if len(arguments) < 3 or not _valid_item_uuid(arguments[2]):
+            raise _usage("item edit requires a 26-character item UUID")
+        if len(arguments) != 3:
+            raise _usage("item edit requires the exact stdin-only form: item edit ITEM_UUID")
+        return (*arguments, "--vault", _VAULT_NAME)
+
+    if arguments == ("vault", "list"):
+        return ("vault", "list", "--format", "json")
+    if arguments == ("vault", "get", _VAULT_NAME):
+        return arguments
+    if arguments == ("item", "list"):
+        return (*arguments, "--vault", _VAULT_NAME)
+    if (
+        len(arguments) == 3
+        and arguments[:2] == ("item", "get")
+        and not arguments[2].startswith("-")
+        and "=" not in arguments[2]
+    ):
+        return (*arguments, "--vault", _VAULT_NAME)
+    if len(arguments) == 2 and arguments[0] == "read":
+        if arguments[1].startswith(f"op://{_VAULT_NAME}/"):
+            return arguments
+        raise _usage("only the Homelab Secrets vault is supported")
+    raise _usage("operation is not supported")
 
 
 def _json_stdin(arguments: Sequence[str], stdin: TextIO) -> Secret | None:
@@ -132,6 +101,30 @@ def _json_stdin(arguments: Sequence[str], stdin: TextIO) -> Secret | None:
     return Secret(payload)
 
 
+def _op_environment_to_unset(environ: Mapping[str, str]) -> tuple[str, ...]:
+    names = _LOCAL_OP_ENVIRONMENT | {
+        name for name in environ if name.startswith("OP_")
+    }
+    return tuple(sorted(names))
+
+
+def _scoped_vault_list(payload: str) -> str:
+    try:
+        decoded = json.loads(payload)
+    except json.JSONDecodeError:
+        raise AgentError("vault list did not return valid JSON") from None
+    if not isinstance(decoded, list):
+        raise AgentError("vault list did not return valid JSON")
+    matches = [
+        entry
+        for entry in decoded
+        if isinstance(entry, dict) and entry.get("name") == _VAULT_NAME
+    ]
+    if len(matches) != 1:
+        raise AgentError("vault list did not return exactly one exact Homelab Secrets vault")
+    return json.dumps(matches[0]) + "\n"
+
+
 def run_op(
     argv: Sequence[str],
     *,
@@ -140,6 +133,7 @@ def run_op(
     route_factory: Callable[..., ConnectRoute] = ConnectRoute,
     runner: Runner | None = None,
     stdin: TextIO = sys.stdin,
+    output: TextIO = sys.stdout,
 ) -> int:
     """Run an approved `op` command with Connect credentials scoped to its child."""
     arguments = validate_op_argv(argv)
@@ -154,7 +148,7 @@ def run_op(
     route = route_factory(keychain=keychain, token=token, account=account)
     command_runner = runner or Runner()
     with route.open(config) as connect_url:
-        command_runner.run(
+        completed = command_runner.run(
             ProcessSpec(
                 argv=(_OP_PATH, *arguments),
                 stdin=json_input,
@@ -162,8 +156,13 @@ def run_op(
                     "OP_CONNECT_HOST": connect_url,
                     "OP_CONNECT_TOKEN": token.reveal(),
                 },
-                unset_env=_CONNECT_ENVIRONMENT,
+                unset_env=_op_environment_to_unset(os.environ),
                 display_name="approved 1Password command",
             )
         )
+    if arguments[:2] == ("vault", "list"):
+        output.write(_scoped_vault_list(completed.stdout or ""))
+    elif arguments[:2] not in (("item", "create"), ("item", "edit")):
+        output.write(completed.stdout or "")
+    output.flush()
     return 0
