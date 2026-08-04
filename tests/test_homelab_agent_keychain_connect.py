@@ -1,9 +1,11 @@
 """Regression tests for redacted Keychain and 1Password Connect clients."""
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import unittest
+import uuid
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
@@ -12,7 +14,7 @@ from urllib.error import URLError
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dot_local" / "lib"))
 
 from homelab_agent.connect import ConnectClient
-from homelab_agent.keychain import Keychain
+from homelab_agent.keychain import Keychain, MacOSKeychainBackend
 from homelab_agent.process import AgentError, ProcessSpec, Runner, Secret
 
 
@@ -151,29 +153,109 @@ class KeychainTests(unittest.TestCase):
         )
         self.assertNotIn(TOKEN, str(fake_process.calls[-1]["argv"]))
 
-    def test_keychain_enrollment_prompts_without_placing_secret_in_argv(self) -> None:
+    def test_keychain_enrollment_writes_a_long_unicode_secret_without_child_process_exposure(self) -> None:
+        secret = "a" * 640 + "\N{SNOWMAN}"
+
+        class Bridge:
+            def __init__(self) -> None:
+                self.created: list[tuple[object, bytes, bytes, bytes, object]] = []
+                self.released: list[object] = []
+                self.trusted_paths: list[str] = []
+
+            def copy_default(self) -> object:
+                return "default-keychain"
+
+            def find_generic_password(self, _keychain: object, _service: bytes, _account: bytes) -> object | None:
+                return None
+
+            def create_security_only_access(self, trusted_path: str) -> object:
+                self.trusted_paths.append(trusted_path)
+                return "security-only-access"
+
+            def create_generic_password(self, keychain: object, service: bytes, account: bytes, value: bytearray, access: object) -> object:
+                self.created.append((keychain, service, account, bytes(value), access))
+                return "new-item"
+
+            def modify_item_data(self, _item: object, _value: bytearray) -> None:
+                self.fail("new item must not modify")
+
+            def release(self, reference: object) -> None:
+                self.released.append(reference)
+
+        bridge = Bridge()
         fake_process = FakeProcess([completed(("/usr/bin/security",))])
-        keychain = Keychain(Runner(fake_process))
+        keychain = Keychain(
+            Runner(fake_process),
+            prompt=lambda _prompt: secret,
+            native_factory=lambda: MacOSKeychainBackend(bridge=bridge),
+        )
 
         keychain.enroll("com.example.connect", "mac-mini")
 
-        argv = fake_process.calls[0]["argv"]
+        self.assertEqual([], fake_process.calls)
         self.assertEqual(
-            (
-                "/usr/bin/security",
-                "add-generic-password",
-                "-U",
-                "-a",
-                "mac-mini",
-                "-s",
-                "com.example.connect",
-                "-T",
-                "/usr/bin/security",
-                "-w",
-            ),
-            argv,
+            ("default-keychain", b"com.example.connect", b"mac-mini", secret.encode("utf-8"), "security-only-access"),
+            bridge.created[0],
         )
-        self.assertEqual("-w", argv[-1])
+        self.assertGreater(len(bridge.created[0][3]), 642)
+        self.assertEqual(["/usr/bin/security"], bridge.trusted_paths)
+        self.assertNotIn(secret, str(fake_process.calls))
+        self.assertNotIn(secret, str(os.environ))
+
+    def test_native_enrollment_updates_existing_data_without_replacing_acl(self) -> None:
+        class Bridge:
+            def __init__(self) -> None:
+                self.modified: list[tuple[object, bytes]] = []
+                self.created = False
+                self.released: list[object] = []
+
+            def copy_default(self) -> object: return "default"
+            def find_generic_password(self, _keychain: object, _service: bytes, _account: bytes) -> object | None: return "existing-with-acl"
+            def modify_item_data(self, item: object, value: bytearray) -> None: self.modified.append((item, bytes(value)))
+            def create_security_only_access(self, _trusted_path: str) -> object: raise AssertionError("existing item must preserve ACL")
+            def create_generic_password(self, *_args: object) -> object: self.fail("existing item must not recreate")
+            def release(self, reference: object) -> None: self.released.append(reference)
+
+        bridge = Bridge()
+        MacOSKeychainBackend(bridge=bridge).store("service", "account", bytearray(b"x" * 643))
+
+        self.assertEqual([("existing-with-acl", b"x" * 643)], bridge.modified)
+        self.assertFalse(bridge.created)
+        self.assertEqual(["existing-with-acl", "default"], bridge.released)
+
+    def test_native_enrollment_rejects_empty_and_redacts_native_failures(self) -> None:
+        keychain = Keychain(prompt=lambda _prompt: "", native_factory=lambda: self.fail("empty value must not open Keychain"))
+        with self.assertRaisesRegex(AgentError, "must not be empty"):
+            keychain.enroll("service", "account")
+
+        class FailingBridge:
+            def copy_default(self) -> object:
+                raise OSError("a" * 643)
+
+        with self.assertRaisesRegex(AgentError, "enrollment failed") as caught:
+            MacOSKeychainBackend(bridge=FailingBridge()).store("service", "account", bytearray(b"x" * 643))
+        self.assertNotIn("a" * 643, str(caught.exception))
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and os.environ.get("HOMELAB_AGENT_KEYCHAIN_INTEGRATION") == "1",
+        "set HOMELAB_AGENT_KEYCHAIN_INTEGRATION=1 to run the macOS Keychain roundtrip",
+    )
+    def test_darwin_keychain_roundtrip_preserves_a_642_byte_secret(self) -> None:
+        service = f"com.4406.homelab-agent.test-{uuid.uuid4()}"
+        account = "homelab-agent-integration"
+        value = "x" * 642
+        keychain = Keychain(prompt=lambda _prompt: value)
+        try:
+            keychain.enroll(service, account)
+            self.assertEqual(value, keychain.read(service, account).reveal())
+        finally:
+            subprocess.run(
+                ("/usr/bin/security", "delete-generic-password", "-s", service, "-a", account),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
 
 
 class ConnectClientTests(unittest.TestCase):
