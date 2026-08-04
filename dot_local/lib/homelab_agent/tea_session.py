@@ -62,7 +62,6 @@ class TeaSession:
             setup_environment = self._child_environment(
                 {
                     "GITEA_SERVER_URL": self._forgejo.api_url,
-                    "GITEA_SERVER_USER": self._forgejo.api_user,
                     "GITEA_SERVER_TOKEN": token.reveal(),
                 }
             )

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import math
 import sys
 import unittest
 from pathlib import Path
@@ -39,6 +40,18 @@ def run(
     }
 
 
+def forgejo14_run(
+    workflow_id: str, run_id: int, status: str, created: str, *, sha: str = SHA
+) -> dict[str, object]:
+    """A real Actions response includes keys outside this policy's scope."""
+    return dict(
+        run(workflow_id, run_id, status, created, sha=sha),
+        event="pull_request", head_branch="reviewed-change", name="infra checks",
+        run_number=17, run_attempt=1, updated="2026-08-04T01:01:00Z",
+        workflow_url="https://git.example/api/v1/workflows/17",
+    )
+
+
 class Session:
     def __init__(self, responses: list[object]) -> None:
         self.responses = list(responses)
@@ -59,11 +72,11 @@ class ForgejoPolicyTests(unittest.TestCase):
         from homelab_agent.forgejo_policy import checks_status
 
         session = Session(
-            [{"workflow_runs": [
-                run("validate.yml", 11, "failure", "2026-08-03T01:00:00Z"),
-                run("validate.yml", 12, "success", "2026-08-04T01:00:00Z"),
-                run("plan.yml", 13, "running", "2026-08-04T01:00:00Z"),
-                run("unapproved.yml", 14, "success", "2026-08-04T01:00:00Z"),
+            [{"total_count": 4, "workflow_runs": [
+                forgejo14_run("validate.yml", 11, "failure", "2026-08-03T01:00:00Z"),
+                forgejo14_run("validate.yml", 12, "success", "2026-08-04T01:00:00Z"),
+                forgejo14_run("plan.yml", 13, "running", "2026-08-04T01:00:00Z"),
+                forgejo14_run("unapproved.yml", 14, "success", "2026-08-04T01:00:00Z"),
             ]}]
         )
 
@@ -74,7 +87,7 @@ class ForgejoPolicyTests(unittest.TestCase):
             (item.workflow, item.run_id, item.state) for item in result.runs
         ])
         self.assertEqual(
-            (f"/repos/homelab/infra/actions/runs?head_sha={SHA}&event=pull_request&limit=50",),
+            (f"/repos/homelab/infra/actions/runs?head_sha={SHA}&event=pull_request&limit=50&page=1",),
             session.calls[0][0],
         )
 
@@ -84,6 +97,8 @@ class ForgejoPolicyTests(unittest.TestCase):
         cases = {
             "missing": ({"workflow_runs": [run("validate.yml", 1, "success", "2026-08-04T01:00:00Z")]}, "pending"),
             "waiting": ({"workflow_runs": [run("validate.yml", 1, "waiting", "2026-08-04T01:00:00Z"), run("plan.yml", 2, "success", "2026-08-04T01:00:00Z")]}, "pending"),
+            "blocked": ({"workflow_runs": [run("validate.yml", 1, "blocked", "2026-08-04T01:00:00Z"), run("plan.yml", 2, "success", "2026-08-04T01:00:00Z")]}, "pending"),
+            "unknown": ({"workflow_runs": [run("validate.yml", 1, "future-state", "2026-08-04T01:00:00Z"), run("plan.yml", 2, "success", "2026-08-04T01:00:00Z")]}, "pending"),
             "success": ({"workflow_runs": [run("validate.yml", 1, "success", "2026-08-04T01:00:00Z"), run("plan.yml", 2, "success", "2026-08-04T01:00:00Z")]}, "success"),
             "failure": ({"workflow_runs": [run("validate.yml", 1, "failure", "2026-08-04T01:00:00Z"), run("plan.yml", 2, "success", "2026-08-04T01:00:00Z")]}, "failure"),
         }
@@ -99,7 +114,8 @@ class ForgejoPolicyTests(unittest.TestCase):
             {},
             {"workflow_runs": "not-a-list"},
             {"workflow_runs": [{"workflow_id": "validate.yml"}]},
-            {"workflow_runs": [dict(run("validate.yml", 1, "success", "2026-08-04T01:00:00Z"), unexpected=True)]},
+            {"workflow_runs": [dict(run("validate.yml", 1, "success", "2026-08-04T01:00:00Z"), id="wrong-type")]},
+            {"workflow_runs": [dict(run("validate.yml", 1, "success", "2026-08-04T01:00:00Z"), created="not-a-timestamp")]},
         )
         for payload in bad_payloads:
             with self.subTest(payload=payload), self.assertRaisesRegex(PolicyError, "Forgejo Actions response was invalid") as caught:
@@ -124,13 +140,80 @@ class ForgejoPolicyTests(unittest.TestCase):
         self.assertEqual("timeout", result.state)
         self.assertEqual([5.0], sleeps)
 
+    def test_wait_rejects_non_finite_timeouts_before_requesting_actions(self) -> None:
+        from homelab_agent.forgejo_policy import PolicyError, checks_wait
+
+        for timeout in (math.nan, math.inf, -math.inf):
+            with self.subTest(timeout=timeout):
+                session = Session([])
+                with self.assertRaises(PolicyError):
+                    checks_wait(session, AUTOMATION, "infra", SHA, timeout=timeout)
+                self.assertEqual([], session.calls)
+
+    def test_checks_wait_polls_blocked_and_unknown_states_until_terminal(self) -> None:
+        from homelab_agent.forgejo_policy import checks_wait
+
+        session = Session([
+            {"workflow_runs": [run("validate.yml", 1, "blocked", "2026-08-04T01:00:00Z"), run("plan.yml", 2, "future-state", "2026-08-04T01:00:00Z")]},
+            {"workflow_runs": [run("validate.yml", 1, "success", "2026-08-04T01:01:00Z"), run("plan.yml", 2, "success", "2026-08-04T01:01:00Z")]},
+        ])
+        clock = iter((0.0, 0.0)).__next__
+        sleeps: list[float] = []
+
+        result = checks_wait(session, AUTOMATION, "infra", SHA, timeout=5, clock=clock, sleeper=sleeps.append)
+
+        self.assertEqual("success", result.state)
+        self.assertEqual([5.0], sleeps)
+
+    def test_check_status_uses_larger_run_id_when_created_timestamps_match(self) -> None:
+        from homelab_agent.forgejo_policy import checks_status
+
+        result = checks_status(Session([{"workflow_runs": [
+            run("validate.yml", 3, "success", "2026-08-04T01:00:00Z"),
+            run("validate.yml", 9, "failure", "2026-08-04T01:00:00Z"),
+            run("plan.yml", 2, "success", "2026-08-04T01:00:00Z"),
+        ]}]), AUTOMATION, "infra", SHA)
+
+        self.assertEqual("failure", result.state)
+        self.assertEqual(9, result.runs[0].run_id)
+
+    def test_check_status_paginates_before_declaring_required_workflows_missing(self) -> None:
+        from homelab_agent.forgejo_policy import checks_status
+
+        first_page = [run("unapproved.yml", index + 1, "success", "2026-08-04T01:00:00Z") for index in range(50)]
+        session = Session([
+            {"total_count": 52, "workflow_runs": first_page},
+            {"total_count": 52, "workflow_runs": [
+                run("validate.yml", 51, "success", "2026-08-04T01:01:00Z"),
+                run("plan.yml", 52, "success", "2026-08-04T01:01:00Z"),
+            ]},
+        ])
+
+        result = checks_status(session, AUTOMATION, "infra", SHA)
+
+        self.assertEqual("success", result.state)
+        self.assertEqual(
+            (f"/repos/homelab/infra/actions/runs?head_sha={SHA}&event=pull_request&limit=50&page=2",),
+            session.calls[1][0],
+        )
+
+    def test_check_status_rejects_a_non_hex_or_short_commit_id_before_request(self) -> None:
+        from homelab_agent.forgejo_policy import PolicyError, checks_status
+
+        for sha in ("bad-sha", "a" * 39, "b" * 64):
+            with self.subTest(sha=sha):
+                session = Session([])
+                with self.assertRaises(PolicyError):
+                    checks_status(session, AUTOMATION, "infra", sha)
+                self.assertEqual([], session.calls)
+
     def test_deploy_dispatch_has_only_the_fixed_endpoint_and_approved_inputs(self) -> None:
         from homelab_agent.forgejo_policy import deploy_stacks
 
-        session = Session([{ "id": 82 }])
+        session = Session([{ "id": 82, "run_number": 17, "jobs": [] }])
         run_id = deploy_stacks(
             session, AUTOMATION, target_host="docker01", reason="approved maintenance",
-            stacks="traefik,authentik", post_deploy_configure=True,
+            stacks="traefik,authentik", post_deploy_configure=True, confirm="apply",
         )
 
         self.assertEqual(82, run_id)
@@ -153,14 +236,15 @@ class ForgejoPolicyTests(unittest.TestCase):
         from homelab_agent.forgejo_policy import PolicyError, deploy_stacks
 
         cases = (
-            {"target_host": "router01", "reason": "reason"},
-            {"target_host": "docker01", "reason": "   "},
-            {"target_host": "docker01", "reason": "reason", "stacks": "traefik,,authentik"},
-            {"target_host": "docker01", "reason": "reason", "stacks": "Traefik"},
+            {"target_host": "router01", "reason": "reason", "confirm": "apply"},
+            {"target_host": "docker01", "reason": "   ", "confirm": "apply"},
+            {"target_host": "docker01", "reason": "reason", "stacks": "traefik,,authentik", "confirm": "apply"},
+            {"target_host": "docker01", "reason": "reason", "stacks": "Traefik", "confirm": "apply"},
+            {"target_host": "docker01", "reason": "reason"},
             {"target_host": "docker01", "reason": "reason", "confirm": "no"},
-            {"target_host": "docker01", "reason": "reason", "repository": "other/repo"},
-            {"target_host": "docker01", "reason": "reason", "workflow": "other.yml"},
-            {"target_host": "docker01", "reason": "reason", "ref": "feature"},
+            {"target_host": "docker01", "reason": "reason", "repository": "other/repo", "confirm": "apply"},
+            {"target_host": "docker01", "reason": "reason", "workflow": "other.yml", "confirm": "apply"},
+            {"target_host": "docker01", "reason": "reason", "ref": "feature", "confirm": "apply"},
         )
         for kwargs in cases:
             with self.subTest(kwargs=kwargs):
@@ -169,18 +253,62 @@ class ForgejoPolicyTests(unittest.TestCase):
                     deploy_stacks(session, AUTOMATION, **kwargs)
                 self.assertEqual([], session.calls)
 
-    def test_deploy_status_blocked_reports_the_production_approval_gate_without_approving_it(self) -> None:
+    def test_deploy_status_blocked_is_a_neutral_non_terminal_state(self) -> None:
         from homelab_agent.forgejo_policy import deploy_status, format_deploy_status
 
-        session = Session([run("infra-stacks-deploy.yml", 82, "blocked", "2026-08-04T01:00:00Z")])
+        session = Session([forgejo14_run("infra-stacks-deploy.yml", 82, "blocked", "2026-08-04T01:00:00Z")])
         result = deploy_status(session, AUTOMATION, 82)
 
         self.assertEqual("blocked", result.state)
         self.assertEqual(
-            "deployment 82 blocked: awaiting Forgejo production environment reviewer",
+            "deployment 82 blocked https://git.example/runs/82",
             format_deploy_status(result),
         )
         self.assertEqual(("/repos/homelab/infra/actions/runs/82",), session.calls[0][0])
+
+    def test_non_successful_deploy_status_has_no_special_approval_exit_code(self) -> None:
+        from homelab_agent.forgejo_policy import run_forgejo
+
+        output = io.StringIO()
+        result = run_forgejo(
+            ["deploy", "status", "82"],
+            session=Session([forgejo14_run("infra-stacks-deploy.yml", 82, "blocked", "2026-08-04T01:00:00Z")]),
+            automation=AUTOMATION,
+            output=output,
+        )
+
+        self.assertEqual(1, result)
+        self.assertEqual("deployment 82 blocked https://git.example/runs/82\n", output.getvalue())
+
+    def test_deploy_wait_polls_a_blocked_run_until_it_reaches_a_terminal_state(self) -> None:
+        from homelab_agent.forgejo_policy import deploy_wait
+
+        session = Session([
+            forgejo14_run("infra-stacks-deploy.yml", 82, "blocked", "2026-08-04T01:00:00Z"),
+            forgejo14_run("infra-stacks-deploy.yml", 82, "future-state", "2026-08-04T01:01:00Z"),
+            forgejo14_run("infra-stacks-deploy.yml", 82, "success", "2026-08-04T01:02:00Z"),
+        ])
+        clock = iter((0.0, 0.0, 0.0)).__next__
+        sleeps: list[float] = []
+
+        result = deploy_wait(session, AUTOMATION, 82, timeout=5, clock=clock, sleeper=sleeps.append)
+
+        self.assertEqual("success", result.state)
+        self.assertEqual([5.0, 5.0], sleeps)
+        self.assertEqual(3, len(session.calls))
+
+    def test_deploy_cli_requires_an_explicit_apply_confirmation(self) -> None:
+        from homelab_agent.forgejo_policy import run_forgejo
+
+        session = Session([{ "id": 82 }])
+        output = io.StringIO()
+        result = run_forgejo(
+            ["deploy", "stacks", "--target-host", "docker01", "--reason", "maintenance", "--confirm", "apply"],
+            session=session, automation=AUTOMATION, output=output,
+        )
+
+        self.assertEqual(0, result)
+        self.assertEqual("apply", session.calls[0][1]["inputs"]["confirm"])
 
     def test_public_check_output_contains_no_response_diagnostics(self) -> None:
         from homelab_agent.forgejo_policy import checks_status, format_checks_status
@@ -210,6 +338,19 @@ class ForgejoCliTests(unittest.TestCase):
 
         stderr = io.StringIO()
         result = cli.main(["forgejo", "deploy", "stacks", "--confirm", "apply"], forgejo_runner=lambda _argv: self.fail("must not dispatch"), error_output=stderr)
+
+        self.assertEqual(2, result)
+        self.assertIn("usage: homelab-agent forgejo", stderr.getvalue())
+
+    def test_cli_rejects_non_apply_confirmation_before_runner(self) -> None:
+        from homelab_agent import cli
+
+        stderr = io.StringIO()
+        result = cli.main(
+            ["forgejo", "deploy", "stacks", "--target-host", "docker01", "--reason", "maintenance", "--confirm", "no"],
+            forgejo_runner=lambda _argv: self.fail("invalid confirmation must not dispatch"),
+            error_output=stderr,
+        )
 
         self.assertEqual(2, result)
         self.assertIn("usage: homelab-agent forgejo", stderr.getvalue())

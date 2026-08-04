@@ -66,7 +66,7 @@ _FORGEJO_HELP = """usage: homelab-agent-forgejo COMMAND
 Approved commands:
   checks status infra SHA
   checks wait infra SHA [--timeout SECONDS]
-  deploy stacks --target-host HOST --reason TEXT [--stacks CSV] [--post-deploy-configure]
+  deploy stacks --target-host HOST --reason TEXT --confirm apply [--stacks CSV] [--post-deploy-configure]
   deploy status RUN_ID
   deploy wait RUN_ID [--timeout SECONDS]
 """
@@ -127,7 +127,7 @@ def _valid_forgejo_invocation(arguments: Sequence[str]) -> bool:
         return len(arguments) == 3 or arguments[3] == "--timeout"
     if arguments[:2] != ["deploy", "stacks"]:
         return False
-    allowed = {"--target-host", "--reason", "--stacks", "--post-deploy-configure"}
+    allowed = {"--target-host", "--reason", "--stacks", "--confirm", "--post-deploy-configure"}
     seen: set[str] = set()
     index = 2
     while index < len(arguments):
@@ -138,10 +138,12 @@ def _valid_forgejo_invocation(arguments: Sequence[str]) -> bool:
         if option == "--post-deploy-configure":
             index += 1
         elif index + 1 < len(arguments):
+            if option == "--confirm" and arguments[index + 1] != "apply":
+                return False
             index += 2
         else:
             return False
-    return {"--target-host", "--reason"}.issubset(seen)
+    return {"--target-host", "--reason", "--confirm"}.issubset(seen)
 
 
 def _usage(arguments: Sequence[str]) -> str:

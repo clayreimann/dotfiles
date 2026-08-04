@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import re
 import time
+import math
 from dataclasses import dataclass
+from datetime import datetime
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol, TextIO
 
@@ -15,11 +17,13 @@ from .ssh_session import ConnectRoute
 from .tea_session import TeaSession
 
 
-_CHECK_STATES = frozenset({"waiting", "running", "success", "failure", "cancelled", "skipped", "blocked"})
-_PENDING_STATES = frozenset({"pending", "waiting", "running"})
-_FAILED_STATES = frozenset({"failure", "cancelled", "skipped", "blocked", "unknown"})
+_KNOWN_STATES = frozenset({"waiting", "running", "success", "failure", "cancelled", "skipped", "blocked"})
+_PENDING_STATES = frozenset({"pending", "waiting", "running", "blocked", "unknown"})
+_FAILED_STATES = frozenset({"failure", "cancelled", "skipped"})
 _STACK_NAME = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
+_COMMIT_SHA = re.compile(r"[0-9a-fA-F]{40}\Z")
 _POLL_INTERVAL = 5.0
+_PAGE_SIZE = 50
 
 
 class PolicyError(AgentError):
@@ -64,31 +68,57 @@ def _string(value: object) -> str:
     return value
 
 
+def _commit_sha(value: object) -> str:
+    if not isinstance(value, str) or not _COMMIT_SHA.fullmatch(value):
+        raise PolicyError("Forgejo Actions response was invalid")
+    return value.lower()
+
+
 def _integer(value: object) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise PolicyError("Forgejo Actions response was invalid")
     return value
 
 
-def _parse_run(value: object) -> tuple[str, int, str, str, str, str]:
-    if not isinstance(value, dict) or set(value) != {"workflow_id", "id", "status", "html_url", "commit_sha", "created"}:
+def _created(value: object) -> datetime:
+    text = _string(value)
+    normalized = f"{text[:-1]}+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        raise PolicyError("Forgejo Actions response was invalid") from None
+    if parsed.tzinfo is None:
+        raise PolicyError("Forgejo Actions response was invalid")
+    return parsed
+
+
+def _parse_run(value: object) -> tuple[str, int, str, str, str, datetime]:
+    required = {"workflow_id", "id", "status", "html_url", "commit_sha", "created"}
+    if not isinstance(value, dict) or not required.issubset(value):
         raise PolicyError("Forgejo Actions response was invalid")
     workflow = _string(value["workflow_id"])
     run_id = _integer(value["id"])
     status = _string(value["status"])
     url = _string(value["html_url"])
-    commit_sha = _string(value["commit_sha"])
-    created = _string(value["created"])
+    commit_sha = _commit_sha(value["commit_sha"])
+    created = _created(value["created"])
     return workflow, run_id, status, url, commit_sha, created
 
 
-def _parse_workflow_runs(payload: object) -> tuple[tuple[str, int, str, str, str, str], ...]:
-    if not isinstance(payload, dict) or set(payload) != {"workflow_runs"}:
+def _parse_workflow_runs(
+    payload: object,
+) -> tuple[tuple[tuple[str, int, str, str, str, datetime], ...], int | None]:
+    if not isinstance(payload, dict) or "workflow_runs" not in payload:
         raise PolicyError("Forgejo Actions response was invalid")
     entries = payload["workflow_runs"]
     if not isinstance(entries, list):
         raise PolicyError("Forgejo Actions response was invalid")
-    return tuple(_parse_run(value) for value in entries)
+    total_count = payload.get("total_count")
+    if total_count is not None and (
+        not isinstance(total_count, int) or isinstance(total_count, bool) or total_count < 0
+    ):
+        raise PolicyError("Forgejo Actions response was invalid")
+    return tuple(_parse_run(value) for value in entries), total_count
 
 
 def _require_checks_repository(automation: Any, repository: str) -> None:
@@ -108,18 +138,39 @@ def _aggregate(runs: tuple[WorkflowRun, ...]) -> str:
 def checks_status(session: ApiSession, automation: Any, repository: str, commit_sha: str) -> CheckStatus:
     """Return the latest known outcome for every pinned required workflow."""
     _require_checks_repository(automation, repository)
-    if not isinstance(commit_sha, str) or not commit_sha:
-        raise PolicyError("commit SHA must be a non-empty string")
-    endpoint = f"/repos/{automation.repository}/actions/runs?head_sha={commit_sha}&event=pull_request&limit=50"
-    entries = _parse_workflow_runs(_request(session, (endpoint,)))
-    newest: dict[str, tuple[int, str, str, str]] = {}
+    if not isinstance(commit_sha, str) or not _COMMIT_SHA.fullmatch(commit_sha):
+        raise PolicyError("commit SHA must be a 40-character hexadecimal commit ID")
+    expected_sha = commit_sha.lower()
+    entries: list[tuple[str, int, str, str, str, datetime]] = []
+    page = 1
+    expected_total: int | None = None
+    while True:
+        endpoint = (
+            f"/repos/{automation.repository}/actions/runs?head_sha={commit_sha}"
+            f"&event=pull_request&limit={_PAGE_SIZE}&page={page}"
+        )
+        page_entries, total_count = _parse_workflow_runs(_request(session, (endpoint,)))
+        entries.extend(page_entries)
+        if total_count is not None:
+            if expected_total is None:
+                expected_total = total_count
+            elif total_count != expected_total:
+                raise PolicyError("Forgejo Actions response was invalid")
+            if len(entries) > expected_total or (not page_entries and len(entries) < expected_total):
+                raise PolicyError("Forgejo Actions response was invalid")
+            if len(entries) == expected_total:
+                break
+        elif len(page_entries) < _PAGE_SIZE:
+            break
+        page += 1
+    newest: dict[str, tuple[int, str, str, datetime]] = {}
     required = set(automation.required_workflows)
     for workflow, run_id, status, url, sha, created in entries:
-        if workflow not in required or sha != commit_sha:
+        if workflow not in required or sha != expected_sha:
             continue
         previous = newest.get(workflow)
-        if previous is None or created > previous[3]:
-            newest[workflow] = (run_id, status if status in _CHECK_STATES else "unknown", url, created)
+        if previous is None or (created, run_id) > (previous[3], previous[0]):
+            newest[workflow] = (run_id, status if status in _KNOWN_STATES else "unknown", url, created)
     result: list[WorkflowRun] = []
     for workflow in automation.required_workflows:
         selected = newest.get(workflow)
@@ -132,7 +183,12 @@ def checks_status(session: ApiSession, automation: Any, repository: str, commit_
 
 
 def _timeout(value: object) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
         raise PolicyError("timeout must be a non-negative number")
     return float(value)
 
@@ -163,8 +219,8 @@ def _validate_deploy_options(
         raise PolicyError("workflow is not approved for deployment")
     if ref is not None and ref != automation.deploy_ref:
         raise PolicyError("ref is not approved for deployment")
-    if confirm is not None:
-        raise PolicyError("deployment confirmation is controlled by policy")
+    if confirm != "apply":
+        raise PolicyError("deployment confirmation must be the literal string apply")
     if not isinstance(target_host, str) or target_host not in automation.deploy_targets:
         raise PolicyError("target host is not approved for deployment")
     if not isinstance(reason, str) or not reason.strip():
@@ -188,7 +244,7 @@ def deploy_stacks(
     post_deploy_configure: object = False, repository: object = None, workflow: object = None,
     ref: object = None, confirm: object = None,
 ) -> int:
-    """Dispatch only the configured stacks workflow with policy-owned confirmation."""
+    """Dispatch only the configured stacks workflow with explicit confirmation."""
     host, safe_reason, stack_csv, configure = _validate_deploy_options(
         automation, target_host=target_host, reason=reason, stacks=stacks,
         post_deploy_configure=post_deploy_configure, repository=repository,
@@ -199,12 +255,12 @@ def deploy_stacks(
         "ref": automation.deploy_ref,
         "return_run_info": True,
         "inputs": {
-            "confirm": "apply", "reason": safe_reason, "target_host": host,
+            "confirm": confirm, "reason": safe_reason, "target_host": host,
             "target_stacks": stack_csv, "run_post_deploy_configure": configure,
         },
     }
     response = _request(session, (endpoint, "--method", "POST", "--data", "@-"), input_json=payload)
-    if not isinstance(response, dict) or set(response) != {"id"}:
+    if not isinstance(response, dict) or "id" not in response:
         raise PolicyError("Forgejo Actions response was invalid")
     return _integer(response["id"])
 
@@ -217,18 +273,18 @@ def deploy_status(session: ApiSession, automation: Any, run_id: object) -> Deplo
     )
     if returned_id != run_number or workflow != automation.deploy_workflow:
         raise PolicyError("Forgejo Actions response was invalid")
-    return DeployStatus(run_number, status if status in _CHECK_STATES else "unknown", url)
+    return DeployStatus(run_number, status if status in _KNOWN_STATES else "unknown", url)
 
 
 def deploy_wait(
     session: ApiSession, automation: Any, run_id: object, *, timeout: object,
     clock: Callable[[], float] = time.monotonic, sleeper: Callable[[float], None] = time.sleep,
 ) -> DeployStatus:
-    """Poll the sole deployment run; blocked is visible but never approved here."""
+    """Poll the sole deployment run while blocked and unknown states remain pending."""
     deadline = clock() + _timeout(timeout)
     while True:
         result = deploy_status(session, automation, run_id)
-        if result.state != "waiting" and result.state != "running":
+        if result.state not in _PENDING_STATES:
             return result
         remaining = deadline - clock()
         if remaining <= 0:
@@ -246,8 +302,6 @@ def format_checks_status(result: CheckStatus) -> str:
 
 
 def format_deploy_status(result: DeployStatus) -> str:
-    if result.state == "blocked":
-        return f"deployment {result.run_id} blocked: awaiting Forgejo production environment reviewer"
     return f"deployment {result.run_id} {result.state} {result.url}"
 
 
@@ -307,14 +361,14 @@ def _deploy_cli_options(values: Sequence[str]) -> dict[str, object]:
             result["post_deploy_configure"] = True
             index += 1
             continue
-        if option not in {"--target-host", "--reason", "--stacks"} or index + 1 >= len(values):
+        if option not in {"--target-host", "--reason", "--stacks", "--confirm"} or index + 1 >= len(values):
             raise PolicyError("invalid Forgejo policy invocation")
         key = option[2:].replace("-", "_")
         if key in result:
             raise PolicyError("invalid Forgejo policy invocation")
         result[key] = values[index + 1]
         index += 2
-    if "target_host" not in result or "reason" not in result:
+    if "target_host" not in result or "reason" not in result or "confirm" not in result:
         raise PolicyError("invalid Forgejo policy invocation")
     return result
 
@@ -322,8 +376,6 @@ def _deploy_cli_options(values: Sequence[str]) -> dict[str, object]:
 def _deploy_exit_code(result: DeployStatus) -> int:
     if result.state == "success":
         return 0
-    if result.state == "blocked":
-        return 2
     return 1
 
 

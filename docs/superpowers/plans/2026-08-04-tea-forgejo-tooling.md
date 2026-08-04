@@ -95,7 +95,7 @@ Run:
 
 Use `tempfile.TemporaryDirectory`, child environment copies, and injected
 process executors. Create the login with `GITEA_SERVER_URL`,
-`GITEA_SERVER_USER`, and `GITEA_SERVER_TOKEN`; remove those variables before
+and `GITEA_SERVER_TOKEN`; remove those variables before
 the caller command. Verify `/user` returns login `claude`. Forward caller
 arguments unchanged after the wrapper's `--` separator.
 
@@ -164,7 +164,10 @@ Run the Step 2 command, then commit as
 - Create: `tests/test_homelab_agent_forgejo.py`
 
 **Interfaces:**
-- Consumes: `TeaSession.api_json`, `ForgejoAutomation`, and the exact Forgejo 14 response fields `workflow_runs`, `workflow_id`, `id`, `status`, `html_url`, `commit_sha`, `created`, and dispatch `id`.
+- Consumes: `TeaSession.api_json`, `ForgejoAutomation`, Forgejo 14 `total_count`
+  pagination metadata, the required ActionRun fields `workflow_id`, `id`,
+  `status`, `html_url`, the current 40-character SHA-1 `commit_sha`, `created`,
+  and dispatch `id`.
 - Produces: `checks status`, `checks wait`, `deploy stacks`, `deploy status`, and `deploy wait`.
 
 - [x] **Step 1: Write failing policy tests**
@@ -173,9 +176,10 @@ Cover newest-run-per-workflow selection, missing/pending/success/failure state
 aggregation, timeout, malformed JSON, unexpected fields/types, redacted Tea
 errors, and public status output. For deploy, reject unapproved repos,
 workflows, refs, hosts, empty reasons, invalid stack CSV, unknown flags, and
-caller-controlled `confirm`; assert the only dispatch body uses `main`,
-`return_run_info: true`, `confirm: apply`, and the approved inputs. Prove
-`blocked` reports the production approval gate without approving it.
+any confirmation other than an explicit caller `apply`; assert the only dispatch body uses `main`,
+`return_run_info: true`, an explicit caller `confirm: apply`, and the approved inputs. Prove
+`blocked` remains a neutral pending state and is polled until it reaches a
+terminal Actions state.
 
 - [x] **Step 2: Run focused tests and confirm RED**
 
@@ -189,7 +193,7 @@ Run:
 
 Use `tea api` only through `TeaSession`. Poll at a bounded interval with an
 injectable clock/sleeper. Return nonzero for terminal failures and timeout;
-return a distinct public waiting result for a blocked deployment. Do not add
+return a non-terminal public status for a blocked deployment. Do not add
 merge, approval, secret, workflow-management, or arbitrary API commands.
 
 - [x] **Step 4: Run the full suite and diff check**

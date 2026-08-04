@@ -126,8 +126,8 @@ class TeaSessionTests(unittest.TestCase):
         self.assertEqual((TEA, "api", "/user", "--login", "homelab-agent"), executor.calls[2]["argv"])
         self.assertEqual((TEA, *arguments), executor.calls[3]["argv"])
         self.assertEqual("https://git.4406.madtown.cloud", executor.calls[1]["env"]["GITEA_SERVER_URL"])
-        self.assertEqual("claude", executor.calls[1]["env"]["GITEA_SERVER_USER"])
         self.assertEqual(TOKEN, executor.calls[1]["env"]["GITEA_SERVER_TOKEN"])
+        self.assertNotIn("GITEA_SERVER_USER", executor.calls[1]["env"])
         for call in (executor.calls[0], executor.calls[2], executor.calls[3]):
             for name in (
                 "GITEA_SERVER_URL",
@@ -320,6 +320,31 @@ class TeaSessionTests(unittest.TestCase):
         self.assertEqual(
             (TEA, "api", "/repos/homelab/infra/actions/runs"), executor.calls[-1]["argv"]
         )
+
+    def test_session_api_json_posts_serialized_data_only_on_standard_input(self) -> None:
+        from homelab_agent.tea_session import TeaSession
+
+        executor = RecordingExecutor(
+            [
+                completed(stdout="Version: 0.14.2\n"),
+                completed(),
+                completed(stdout='{"login":"claude"}'),
+                completed(stdout='{"id":82}'),
+            ]
+        )
+        session = TeaSession(config().forgejo, FakeConnectClient(), executor=executor, environ={})
+        with session:
+            response = session.api_json(
+                ["/repos/homelab/infra/actions/workflows/infra-stacks-deploy.yml/dispatches", "--method", "POST", "--data", "@-"],
+                input_json={"ref": "main"},
+            )
+
+        self.assertEqual({"id": 82}, response)
+        self.assertEqual(
+            (TEA, "api", "/repos/homelab/infra/actions/workflows/infra-stacks-deploy.yml/dispatches", "--method", "POST", "--data", "@-"),
+            executor.calls[-1]["argv"],
+        )
+        self.assertEqual('{"ref": "main"}', executor.calls[-1]["input"])
 
     def test_setup_errors_are_redacted_and_cleanup_the_temporary_root_after_failure(self) -> None:
         try:

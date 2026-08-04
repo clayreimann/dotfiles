@@ -492,7 +492,7 @@ class CommandHelpTests(unittest.TestCase):
                 "Approved commands:\n"
                 "  checks status infra SHA\n"
                 "  checks wait infra SHA [--timeout SECONDS]\n"
-                "  deploy stacks --target-host HOST --reason TEXT [--stacks CSV] [--post-deploy-configure]\n"
+                "  deploy stacks --target-host HOST --reason TEXT --confirm apply [--stacks CSV] [--post-deploy-configure]\n"
                 "  deploy status RUN_ID\n"
                 "  deploy wait RUN_ID [--timeout SECONDS]\n"
             ),
