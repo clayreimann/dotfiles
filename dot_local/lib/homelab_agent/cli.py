@@ -14,6 +14,7 @@ from .keychain import Keychain
 from .op_command import run_op
 from .process import AgentError
 from .ssh_session import ConnectRoute, EphemeralAgent, run_pinned_ssh, run_target_ssh
+from .tea_session import run_tea
 
 
 _MAIN_HELP = """usage: homelab-agent <command>
@@ -24,6 +25,7 @@ Commands:
   git clone NAME|clone-foundation|configure PATH|fetch NAME
   ssh TARGET -- COMMAND...
   op <approved 1Password command>
+  tea -- TEA_ARGS...
 """
 _GIT_HELP = """usage: homelab-agent-git clone NAME|clone-foundation|configure PATH|fetch NAME
 
@@ -52,6 +54,11 @@ Approved commands (Homelab Secrets only):
 Item deletion is intentionally unsupported. Create and edit accept no flags or
 assignments; provide the complete JSON object on standard input.
 """
+_TEA_HELP = """usage: homelab-agent-tea -- TEA_ARGS...
+
+TEA_ARGS are passed unchanged to Tea after ephemeral authentication to the
+approved Forgejo server.
+"""
 
 
 def _help(arguments: Sequence[str]) -> str | None:
@@ -64,6 +71,8 @@ def _help(arguments: Sequence[str]) -> str | None:
         return _SSH_HELP
     if arguments == ["op", "--help"]:
         return _OP_HELP
+    if arguments == ["tea", "--help"]:
+        return _TEA_HELP
     return None
 
 
@@ -76,6 +85,8 @@ def _valid_invocation(arguments: Sequence[str]) -> bool:
         return len(arguments) >= 4 and arguments[2] == "--"
     if arguments and arguments[0] == "op":
         return len(arguments) >= 2
+    if arguments and arguments[0] == "tea":
+        return len(arguments) >= 3 and arguments[1] == "--"
     if arguments and arguments[0] == "git":
         return (
             len(arguments) == 2 and arguments[1] == "clone-foundation"
@@ -94,6 +105,8 @@ def _usage(arguments: Sequence[str]) -> str:
         return "usage: homelab-agent ssh TARGET -- COMMAND..."
     if arguments and arguments[0] == "op":
         return "usage: homelab-agent op <approved 1Password command>"
+    if arguments and arguments[0] == "tea":
+        return "usage: homelab-agent tea -- TEA_ARGS..."
     if arguments and arguments[0] == "git":
         return "usage: homelab-agent git clone NAME|clone-foundation|configure PATH|fetch NAME"
     if arguments and arguments[0] == "doctor":
@@ -195,6 +208,7 @@ def main(
     route_factory: Callable[..., ConnectRoute] = ConnectRoute,
     op_runner: Callable[[Sequence[str]], int] = run_op,
     git_runner: Callable[[Sequence[str]], int] = run_git,
+    tea_runner: Callable[[Sequence[str]], int] = run_tea,
     doctor_runner: Callable[[bool], Sequence[CheckResult]] | None = None,
     enroll_runner: Callable[[str], None] | None = None,
     output: TextIO | None = None,
@@ -246,6 +260,8 @@ def main(
             return op_runner(arguments[1:])
         if arguments[0] == "git":
             return git_runner(arguments[1:])
+        if arguments[0] == "tea":
+            return tea_runner(arguments[2:])
         return run(
             arguments,
             load=load,

@@ -399,6 +399,40 @@ class OpCommandTests(unittest.TestCase):
         self.assertEqual(7, rc)
         self.assertEqual([("item", "list")], observed)
 
+    def test_cli_forwards_tea_arguments_only_after_the_exact_separator(self) -> None:
+        from homelab_agent import cli
+
+        observed: list[tuple[str, ...]] = []
+        rc = cli.main(
+            ["tea", "--", "api", "/repos/{owner}/{repo}/issues", "--repo", "owner/repo"],
+            tea_runner=lambda argv: observed.append(tuple(argv)) or 11,
+        )
+
+        self.assertEqual(11, rc)
+        self.assertEqual(
+            [("api", "/repos/{owner}/{repo}/issues", "--repo", "owner/repo")],
+            observed,
+        )
+
+    def test_cli_rejects_tea_invocations_without_an_exact_separator(self) -> None:
+        from homelab_agent import cli
+
+        for argv in (
+            ["tea"],
+            ["tea", "api", "/user"],
+            ["tea", "--"],
+        ):
+            with self.subTest(argv=argv):
+                stderr = io.StringIO()
+                rc = cli.main(
+                    argv,
+                    tea_runner=lambda _argv: self.fail("invalid Tea syntax must not dispatch"),
+                    error_output=stderr,
+                )
+
+                self.assertEqual(2, rc)
+                self.assertIn("usage: homelab-agent tea -- TEA_ARGS...", stderr.getvalue())
+
 
 class CommandHelpTests(unittest.TestCase):
     """The installed wrappers expose help without loading config or secrets."""
@@ -415,6 +449,7 @@ class CommandHelpTests(unittest.TestCase):
                 "  git clone NAME|clone-foundation|configure PATH|fetch NAME\n"
                 "  ssh TARGET -- COMMAND...\n"
                 "  op <approved 1Password command>\n"
+                "  tea -- TEA_ARGS...\n"
             ),
             ("git", "--help"): (
                 "usage: homelab-agent-git clone NAME|clone-foundation|configure PATH|fetch NAME\n\n"
@@ -441,6 +476,12 @@ class CommandHelpTests(unittest.TestCase):
                 "  read op://Homelab Secrets/ITEM/FIELD\n\n"
                 "Item deletion is intentionally unsupported. Create and edit accept no flags or\n"
                 "assignments; provide the complete JSON object on standard input.\n"
+            ),
+            ("tea", "--help"): (
+                "usage: homelab-agent-tea -- TEA_ARGS...\n"
+                "\n"
+                "TEA_ARGS are passed unchanged to Tea after ephemeral authentication to the\n"
+                "approved Forgejo server.\n"
             ),
         }
         for argv, help_text in expected.items():
