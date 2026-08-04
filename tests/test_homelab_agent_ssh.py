@@ -2,21 +2,25 @@
 from __future__ import annotations
 
 import os
+import io
 import stat
 import subprocess
 import sys
-import tempfile
 import unittest
+from contextlib import contextmanager
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any
 from unittest.mock import patch
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dot_local" / "lib"))
 
-from homelab_agent.models import SshIdentity
+from homelab_agent.config import ConfigError
+from homelab_agent.models import Bastion, ManagedTarget, SshIdentity
 from homelab_agent.process import AgentError, Runner, Secret
+from homelab_agent import ssh_session
 from homelab_agent.ssh_session import EphemeralAgent, run_pinned_ssh
 
 
@@ -34,6 +38,41 @@ def identity() -> SshIdentity:
         private_field="private_key",
         expected_fingerprint=FINGERPRINT,
         known_host="[git.4406.madtown.cloud]:2222 ssh-ed25519 AAAAC3NzaPinnedHostKey",
+    )
+
+
+def target(*, route: str = "direct") -> ManagedTarget:
+    return ManagedTarget(
+        alias="monitor01",
+        route=route,  # type: ignore[arg-type]
+        host="monitor01",
+        port=22,
+        user="ubuntu",
+        credential_item_id="target-item-id",
+        private_field="private_key",
+        expected_fingerprint=FINGERPRINT,
+        known_host="monitor01 ssh-ed25519 AAAAC3NzaTargetHostKey",
+    )
+
+
+def bastion() -> Bastion:
+    return Bastion(
+        host="bastion.example",
+        port=22,
+        user="clay",
+        encrypted_key_path=Path("/Users/clay/.ssh/homelab_bastion_bootstrap"),
+        known_host="bastion.example ssh-ed25519 AAAAC3NzaBastionHostKey",
+    )
+
+
+def route_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        direct_connect_url="http://192.168.42.253:8080",
+        tunnel_connect_url="http://127.0.0.1:18080",
+        connect_keychain_service="connect-service",
+        bastion_keychain_service="bastion-service",
+        vault_name="Homelab Secrets",
+        bastion=bastion(),
     )
 
 
@@ -65,6 +104,92 @@ class FakeConnect:
     def get_string_field(self, item_id: str, field: str) -> Secret:
         self.calls.append((item_id, field))
         return Secret(self.value)
+
+
+class FakeKeychain:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, ...]] = []
+
+    def local_account(self) -> str:
+        self.calls.append(("local_account",))
+        return "test-mac"
+
+    def read(self, service: str, account: str) -> Secret:
+        self.calls.append(("read", service, account))
+        values = {
+            "connect-service": "connect-token",
+            "bastion-service": "bastion-passphrase",
+        }
+        return Secret(values[service])
+
+
+class FakeTunnelProcess:
+    def __init__(self, *, returncode: int | None = None) -> None:
+        self.returncode = returncode
+        self.terminated = False
+        self.killed = False
+        self.waited = False
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = 0
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.waited = True
+        return 0 if self.returncode is None else self.returncode
+
+
+class FakePopen:
+    def __init__(self, responses: list[object]) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict[str, object]] = []
+
+    def __call__(self, argv: tuple[str, ...], **kwargs: Any) -> FakeTunnelProcess:
+        self.calls.append({"argv": argv, **kwargs})
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        assert isinstance(response, FakeTunnelProcess)
+        return response
+
+
+class FakeHealthFactory:
+    def __init__(self, outcomes: dict[str, list[object]]) -> None:
+        self.outcomes = {url: deque(values) for url, values in outcomes.items()}
+        self.calls: list[tuple[str, Secret, str]] = []
+
+    def __call__(self, url: str, token: Secret, *, vault_name: str) -> object:
+        self.calls.append((url, token, vault_name))
+        outcomes = self.outcomes[url]
+
+        class Client:
+            def health(self) -> None:
+                outcome = outcomes.popleft()
+                if isinstance(outcome, BaseException):
+                    raise outcome
+
+        return Client()
+
+
+class FakeAgentSession:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+        self.exited = False
+
+    @contextmanager
+    def identity(self, item_id: str, field: str, fingerprint: str):
+        self.calls.append((item_id, field, fingerprint))
+        try:
+            yield SimpleNamespace(socket_path="/private/tmp/target-agent.sock", pid=8181)
+        finally:
+            self.exited = True
 
 
 def agent_responses(*, fingerprint: str = FINGERPRINT) -> list[subprocess.CompletedProcess[str]]:
@@ -399,8 +524,423 @@ class PinnedForgejoSshTests(unittest.TestCase):
             self.assertNotIn(PRIVATE_KEY, str(call["argv"]))
 
 
+class ConnectRouteTests(unittest.TestCase):
+    def test_direct_health_success_never_reads_bastion_passphrase_or_starts_ssh(self) -> None:
+        keychain = FakeKeychain()
+        connect = FakeHealthFactory(
+            {"http://192.168.42.253:8080": [None]}
+        )
+        popen = FakePopen([])
+        route = ssh_session.ConnectRoute(
+            keychain=keychain,
+            connect_factory=connect,
+            popen_executor=popen,
+            sleeper=lambda _seconds: None,
+        )
+
+        with route.open(route_config()) as url:
+            self.assertEqual("http://192.168.42.253:8080", url)
+
+        self.assertEqual(
+            [
+                ("local_account",),
+                ("read", "connect-service", "test-mac"),
+            ],
+            keychain.calls,
+        )
+        self.assertEqual([], popen.calls)
+
+    def test_direct_refusal_opens_pinned_tunnel_with_private_askpass_then_cleans_up(self) -> None:
+        keychain = FakeKeychain()
+        connect = FakeHealthFactory(
+            {
+                "http://192.168.42.253:8080": [AgentError("direct refused")],
+                "http://127.0.0.1:18080": [None],
+            }
+        )
+        process = FakeTunnelProcess()
+        popen = FakePopen([process])
+        route = ssh_session.ConnectRoute(
+            keychain=keychain,
+            connect_factory=connect,
+            popen_executor=popen,
+            sleeper=lambda _seconds: None,
+        )
+
+        with route.open(route_config()) as url:
+            self.assertEqual("http://127.0.0.1:18080", url)
+            call = popen.calls[0]
+            argv = call["argv"]
+            env = call["env"]
+            assert isinstance(argv, tuple)
+            assert isinstance(env, dict)
+            self.assertEqual("/usr/bin/ssh", argv[0])
+            self.assertIn("ExitOnForwardFailure=yes", argv)
+            self.assertIn("IdentitiesOnly=yes", argv)
+            self.assertIn("IdentityAgent=none", argv)
+            self.assertIn("127.0.0.1:18080:192.168.42.253:8080", argv)
+            self.assertIn(str(bastion().encrypted_key_path), argv)
+            self.assertIn("StrictHostKeyChecking=yes", argv)
+            self.assertEqual("force", env["SSH_ASKPASS_REQUIRE"])
+            self.assertEqual("bastion-service", env["HOMELAB_AGENT_ASKPASS_SERVICE"])
+            self.assertEqual("test-mac", env["HOMELAB_AGENT_ASKPASS_ACCOUNT"])
+            askpass_path = Path(env["SSH_ASKPASS"])
+            self.assertTrue(askpass_path.exists())
+            self.assertIn("homelab_agent.cli askpass", askpass_path.read_text(encoding="utf-8"))
+            self.assertNotIn("bastion-passphrase", str(call))
+            self.assertIs(subprocess.DEVNULL, call["stdin"])
+
+        self.assertEqual(
+            [
+                ("local_account",),
+                ("read", "connect-service", "test-mac"),
+            ],
+            keychain.calls,
+        )
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.waited)
+
+    def test_tunnel_startup_failure_is_redacted_and_removes_temporary_files(self) -> None:
+        keychain = FakeKeychain()
+        connect = FakeHealthFactory(
+            {"http://192.168.42.253:8080": [AgentError("direct refused")]}
+        )
+        popen = FakePopen([OSError("secret child failure")])
+        route = ssh_session.ConnectRoute(
+            keychain=keychain,
+            connect_factory=connect,
+            popen_executor=popen,
+            sleeper=lambda _seconds: None,
+        )
+
+        with self.assertRaisesRegex(AgentError, "bastion tunnel could not be started") as caught:
+            with route.open(route_config()):
+                self.fail("failed tunnel startup must not yield a Connect URL")
+
+        call = popen.calls[0]
+        env = call["env"]
+        assert isinstance(env, dict)
+        self.assertFalse(Path(env["SSH_ASKPASS"]).exists())
+        self.assertNotIn("secret child failure", str(caught.exception))
+        self.assertNotIn("bastion-passphrase", str(caught.exception))
+
+    def test_wrong_bastion_host_key_exit_stops_before_tunneled_connect(self) -> None:
+        keychain = FakeKeychain()
+        connect = FakeHealthFactory(
+            {
+                "http://192.168.42.253:8080": [AgentError("direct refused")],
+                "http://127.0.0.1:18080": [AgentError("tunnel refused")],
+            }
+        )
+        process = FakeTunnelProcess(returncode=255)
+        popen = FakePopen([process])
+        route = ssh_session.ConnectRoute(
+            keychain=keychain,
+            connect_factory=connect,
+            popen_executor=popen,
+            sleeper=lambda _seconds: None,
+        )
+
+        with self.assertRaisesRegex(AgentError, "bastion tunnel exited before becoming healthy"):
+            with route.open(route_config()):
+                self.fail("wrong host trust must not yield a Connect URL")
+
+        argv = popen.calls[0]["argv"]
+        assert isinstance(argv, tuple)
+        known_hosts = Path(
+            next(value.removeprefix("UserKnownHostsFile=") for value in argv if value.startswith("UserKnownHostsFile="))
+        )
+        self.assertFalse(known_hosts.exists())
+        self.assertTrue(process.waited)
+
+    def test_askpass_reads_the_exact_keychain_item_without_secret_argv_or_environment(self) -> None:
+        from homelab_agent import cli
+
+        keychain = FakeKeychain()
+        output = io.StringIO()
+        rc = cli.run(
+            ["askpass"],
+            keychain_factory=lambda: keychain,
+            load=lambda: route_config(),
+            environ={
+                "HOMELAB_AGENT_ASKPASS_SERVICE": "bastion-service",
+                "HOMELAB_AGENT_ASKPASS_ACCOUNT": "test-mac",
+            },
+            output=output,
+        )
+
+        self.assertEqual(0, rc)
+        self.assertEqual("bastion-passphrase\n", output.getvalue())
+        self.assertEqual(
+            [
+                ("local_account",),
+                ("read", "bastion-service", "test-mac"),
+            ],
+            keychain.calls,
+        )
+
+    def test_askpass_rejects_substituted_keychain_reference_before_secret_read(self) -> None:
+        from homelab_agent import cli
+
+        for name, service, account in (
+            ("service", "other-service", "test-mac"),
+            ("account", "bastion-service", "other-mac"),
+        ):
+            with self.subTest(name=name):
+                keychain = FakeKeychain()
+                with self.assertRaisesRegex(
+                    AgentError, "bastion askpass Keychain reference is not approved"
+                ):
+                    cli.run(
+                        ["askpass"],
+                        load=lambda: route_config(),
+                        keychain_factory=lambda: keychain,
+                        environ={
+                            "HOMELAB_AGENT_ASKPASS_SERVICE": service,
+                            "HOMELAB_AGENT_ASKPASS_ACCOUNT": account,
+                        },
+                        output=io.StringIO(),
+                    )
+
+                self.assertEqual([("local_account",)], keychain.calls)
+
+    def test_cleanup_kills_and_reaps_when_graceful_termination_raises(self) -> None:
+        class UncooperativeProcess(FakeTunnelProcess):
+            def terminate(self) -> None:
+                self.terminated = True
+                raise OSError("terminate failed")
+
+        keychain = FakeKeychain()
+        connect = FakeHealthFactory(
+            {
+                "http://192.168.42.253:8080": [AgentError("direct refused")],
+                "http://127.0.0.1:18080": [None],
+            }
+        )
+        process = UncooperativeProcess()
+        route = ssh_session.ConnectRoute(
+            keychain=keychain,
+            connect_factory=connect,
+            popen_executor=FakePopen([process]),
+            sleeper=lambda _seconds: None,
+        )
+
+        with route.open(route_config()):
+            pass
+
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.killed)
+        self.assertTrue(process.waited)
+
+
+class ManagedTargetSshTests(unittest.TestCase):
+    def test_direct_target_uses_exact_item_and_preserves_remote_argv(self) -> None:
+        agent = FakeAgentSession()
+        observed: dict[str, object] = {}
+
+        def ssh_executor(argv: tuple[str, ...], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            observed["argv"] = argv
+            observed["known_hosts"] = Path(
+                next(value.removeprefix("UserKnownHostsFile=") for value in argv if value.startswith("UserKnownHostsFile="))
+            ).read_text(encoding="utf-8")
+            return completed(argv, returncode=23)
+
+        rc = ssh_session.run_target_ssh(
+            target(),
+            ["uname", "-a"],
+            agent=agent,
+            ssh_executor=ssh_executor,
+        )
+
+        argv = observed["argv"]
+        assert isinstance(argv, tuple)
+        self.assertEqual(23, rc)
+        self.assertEqual(
+            [("target-item-id", "private_key", FINGERPRINT)],
+            agent.calls,
+        )
+        self.assertEqual(("ubuntu@monitor01", "uname", "-a"), argv[-3:])
+        self.assertIn("IdentityAgent=/private/tmp/target-agent.sock", argv)
+        self.assertIn("IdentityFile=none", argv)
+        self.assertIn("StrictHostKeyChecking=yes", argv)
+        self.assertEqual(target().known_host + "\n", observed["known_hosts"])
+        self.assertTrue(agent.exited)
+
+    def test_bastion_target_uses_os_port_host_alias_and_separate_credentials(self) -> None:
+        agent = FakeAgentSession()
+        process = FakeTunnelProcess()
+        popen = FakePopen([process])
+        observed: dict[str, object] = {}
+
+        def ssh_executor(argv: tuple[str, ...], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            observed["argv"] = argv
+            return completed(argv)
+
+        rc = ssh_session.run_target_ssh(
+            target(route="bastion"),
+            ["systemctl", "is-active", "node-exporter"],
+            agent=agent,
+            ssh_executor=ssh_executor,
+            bastion=bastion(),
+            bastion_keychain_service="bastion-service",
+            keychain_account="test-mac",
+            popen_executor=popen,
+            allocate_port=lambda: 49152,
+            forward_ready=lambda _host, _port: True,
+            sleeper=lambda _seconds: None,
+        )
+
+        tunnel_argv = popen.calls[0]["argv"]
+        outer_argv = observed["argv"]
+        assert isinstance(tunnel_argv, tuple)
+        assert isinstance(outer_argv, tuple)
+        self.assertEqual(0, rc)
+        self.assertIn("127.0.0.1:49152:monitor01:22", tunnel_argv)
+        self.assertIn("IdentitiesOnly=yes", tunnel_argv)
+        self.assertIn("IdentityAgent=none", tunnel_argv)
+        self.assertNotIn("/private/tmp/target-agent.sock", tunnel_argv)
+        self.assertIn("IdentityAgent=/private/tmp/target-agent.sock", outer_argv)
+        self.assertIn("HostKeyAlias=monitor01", outer_argv)
+        self.assertEqual("49152", outer_argv[outer_argv.index("-p") + 1])
+        self.assertEqual(
+            ("ubuntu@127.0.0.1", "systemctl", "is-active", "node-exporter"),
+            outer_argv[-4:],
+        )
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.waited)
+        self.assertTrue(agent.exited)
+
+    def test_tunnel_is_removed_after_target_failure(self) -> None:
+        agent = FakeAgentSession()
+        process = FakeTunnelProcess()
+        popen = FakePopen([process])
+
+        with self.assertRaisesRegex(AgentError, "target SSH failed"):
+            ssh_session.run_target_ssh(
+                target(route="bastion"),
+                ["true"],
+                agent=agent,
+                ssh_executor=lambda _argv: (_ for _ in ()).throw(AgentError("target SSH failed")),
+                bastion=bastion(),
+                bastion_keychain_service="bastion-service",
+                keychain_account="test-mac",
+                popen_executor=popen,
+                allocate_port=lambda: 49153,
+                forward_ready=lambda _host, _port: True,
+                sleeper=lambda _seconds: None,
+            )
+
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.waited)
+        self.assertTrue(agent.exited)
+
+    def test_bastion_target_forward_failure_stops_before_target_agent(self) -> None:
+        agent = FakeAgentSession()
+        process = FakeTunnelProcess(returncode=255)
+        popen = FakePopen([process])
+        ssh_calls: list[tuple[str, ...]] = []
+
+        with self.assertRaisesRegex(AgentError, "bastion tunnel exited before becoming healthy"):
+            ssh_session.run_target_ssh(
+                target(route="bastion"),
+                ["true"],
+                agent=agent,
+                ssh_executor=lambda argv: ssh_calls.append(argv),  # type: ignore[return-value]
+                bastion=bastion(),
+                bastion_keychain_service="bastion-service",
+                keychain_account="test-mac",
+                popen_executor=popen,
+                allocate_port=lambda: 49154,
+                forward_ready=lambda _host, _port: False,
+                sleeper=lambda _seconds: None,
+            )
+
+        self.assertEqual([], agent.calls)
+        self.assertEqual([], ssh_calls)
+        self.assertTrue(process.waited)
+
+
 class CliTests(unittest.TestCase):
-    def test_cli_uses_approved_direct_or_tunnel_url_and_preserves_git_args(self) -> None:
+    def test_unknown_target_never_reads_keychain(self) -> None:
+        from homelab_agent import cli
+
+        keychain = FakeKeychain()
+        config = SimpleNamespace(
+            target=lambda alias: (_ for _ in ()).throw(ConfigError(f"unmapped target: {alias}"))
+        )
+
+        with self.assertRaisesRegex(ConfigError, "unmapped target: not-a-host"):
+            cli.run(
+                ["ssh", "not-a-host", "--", "true"],
+                load=lambda: config,
+                keychain_factory=lambda: keychain,
+            )
+
+        self.assertEqual([], keychain.calls)
+
+    def test_mapped_target_cli_routes_connect_and_preserves_command_arguments(self) -> None:
+        from homelab_agent import cli
+
+        mapped_target = target(route="bastion")
+        config = SimpleNamespace(
+            direct_connect_url="http://direct.example:8080",
+            tunnel_connect_url="http://127.0.0.1:18080",
+            connect_keychain_service="connect-service",
+            bastion_keychain_service="bastion-service",
+            vault_name="Homelab Secrets",
+            bastion=bastion(),
+            target=lambda alias: mapped_target if alias == "monitor01" else None,
+        )
+        keychain = FakeKeychain()
+        observed: dict[str, object] = {}
+
+        class FakeRoute:
+            @contextmanager
+            def open(self, supplied_config: object):
+                observed["route_config"] = supplied_config
+                yield "http://direct.example:8080"
+
+        class FakeConnectClient:
+            def __init__(self, url: str, token: Secret, *, vault_name: str) -> None:
+                observed["connect"] = (url, token, vault_name)
+
+        def target_transport(
+            supplied_target: ManagedTarget, remote_args: list[str], **kwargs: object
+        ) -> int:
+            observed["target"] = supplied_target
+            observed["remote_args"] = remote_args
+            observed["agent"] = kwargs["agent"]
+            observed["transport_kwargs"] = kwargs
+            return 29
+
+        with patch.object(cli, "EphemeralAgent", lambda client: ("agent", client)):
+            rc = cli.run(
+                ["ssh", "monitor01", "--", "printf", "%s", "hello world"],
+                load=lambda: config,
+                keychain_factory=lambda: keychain,
+                connect_factory=FakeConnectClient,
+                route_factory=lambda **_kwargs: FakeRoute(),
+                target_transport=target_transport,
+            )
+
+        self.assertEqual(29, rc)
+        self.assertIs(config, observed["route_config"])
+        self.assertEqual(mapped_target, observed["target"])
+        self.assertEqual(["printf", "%s", "hello world"], observed["remote_args"])
+        transport_kwargs = observed["transport_kwargs"]
+        assert isinstance(transport_kwargs, dict)
+        self.assertNotIn("bastion_passphrase", transport_kwargs)
+        self.assertEqual("bastion-service", transport_kwargs["bastion_keychain_service"])
+        self.assertEqual("test-mac", transport_kwargs["keychain_account"])
+        self.assertEqual(
+            [
+                ("local_account",),
+                ("read", "connect-service", "test-mac"),
+            ],
+            keychain.calls,
+        )
+
+    def test_cli_uses_health_selected_connect_url_and_preserves_git_args(self) -> None:
         from homelab_agent import cli
 
         config = SimpleNamespace(
@@ -415,6 +955,12 @@ class CliTests(unittest.TestCase):
             read=lambda service, account: Secret("connect-token"),
         )
         observed: dict[str, object] = {}
+
+        class FakeRoute:
+            @contextmanager
+            def open(self, supplied_config: object):
+                observed["route_config"] = supplied_config
+                yield "http://direct.example:8080"
 
         class FakeConnectClient:
             def __init__(self, url: str, token: Secret, *, vault_name: str) -> None:
@@ -435,10 +981,12 @@ class CliTests(unittest.TestCase):
                 keychain_factory=lambda: keychain,
                 connect_factory=FakeConnectClient,
                 transport=transport,
+                route_factory=lambda **_kwargs: FakeRoute(),
             )
 
         self.assertEqual(17, rc)
         self.assertEqual("http://direct.example:8080", observed["url"])
+        self.assertIs(config, observed["route_config"])
         self.assertEqual(identity(), observed["identity"])
         self.assertEqual(
             ["git@git.4406.madtown.cloud", "git-upload-pack 'homelab/infra.git'"],

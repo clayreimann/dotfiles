@@ -3,16 +3,20 @@ from __future__ import annotations
 
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, ContextManager, Iterator, Sequence
+from typing import Callable, Iterator, Protocol, Sequence
+from urllib.parse import urlsplit
 
 from .connect import ConnectClient
-from .models import SshIdentity
+from .keychain import Keychain
+from .models import AgentConfig, Bastion, ManagedTarget, SshIdentity
 from .process import AgentError, ProcessSpec, Runner, Secret
 
 
@@ -43,6 +47,24 @@ _PINNED_SECURITY_OPTIONS = frozenset(
     }
 )
 SshExecutor = Callable[..., subprocess.CompletedProcess[str]]
+PopenExecutor = Callable[..., object]
+_TUNNEL_ATTEMPTS = 20
+_TUNNEL_RETRY_SECONDS = 0.1
+_TUNNEL_WAIT_SECONDS = 5.0
+_ASKPASS_SERVICE_ENV = "HOMELAB_AGENT_ASKPASS_SERVICE"
+_ASKPASS_ACCOUNT_ENV = "HOMELAB_AGENT_ASKPASS_ACCOUNT"
+
+
+class TunnelProcess(Protocol):
+    returncode: int | None
+
+    def poll(self) -> int | None: ...
+
+    def terminate(self) -> None: ...
+
+    def kill(self) -> None: ...
+
+    def wait(self, timeout: float | None = None) -> int: ...
 
 
 class EphemeralAgent:
@@ -290,3 +312,382 @@ def run_pinned_ssh(
             known_hosts_path.unlink()
         except FileNotFoundError:
             pass
+
+
+@contextmanager
+def _known_hosts_file(known_host: str) -> Iterator[Path]:
+    known_hosts_fd, known_hosts_name = tempfile.mkstemp(
+        prefix="homelab-agent-known-hosts-"
+    )
+    known_hosts_path = Path(known_hosts_name)
+    try:
+        os.fchmod(known_hosts_fd, 0o600)
+        with os.fdopen(known_hosts_fd, "w", encoding="utf-8") as known_hosts:
+            known_hosts.write(known_host)
+            known_hosts.write("\n")
+        yield known_hosts_path
+    finally:
+        try:
+            known_hosts_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@contextmanager
+def _askpass_program() -> Iterator[Path]:
+    with tempfile.TemporaryDirectory(prefix="homelab-agent-askpass-") as directory:
+        path = Path(directory) / "askpass"
+        path.write_text(
+            "#!/bin/zsh\n"
+            "exec /usr/bin/env PYTHONPATH=/Users/clay/.local/lib "
+            "/opt/homebrew/bin/python3.12 -m homelab_agent.cli askpass\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o700)
+        yield path
+
+
+def _tunnel_environment(
+    askpass: Path, keychain_service: str, keychain_account: str
+) -> dict[str, str]:
+    environment = os.environ.copy()
+    for name in _AGENT_ENVIRONMENT_NAMES:
+        environment.pop(name, None)
+    environment.update(
+        {
+            "SSH_ASKPASS": str(askpass),
+            "SSH_ASKPASS_REQUIRE": "force",
+            _ASKPASS_SERVICE_ENV: keychain_service,
+            _ASKPASS_ACCOUNT_ENV: keychain_account,
+        }
+    )
+    return environment
+
+
+def _stop_tunnel(process: TunnelProcess) -> None:
+    running = True
+    try:
+        running = process.poll() is None
+    except Exception:
+        pass
+
+    terminate_failed = False
+    if running:
+        try:
+            process.terminate()
+        except Exception:
+            terminate_failed = True
+
+    if not terminate_failed:
+        try:
+            process.wait(timeout=_TUNNEL_WAIT_SECONDS)
+            return
+        except Exception:
+            pass
+
+    try:
+        process.kill()
+    except Exception:
+        pass
+    try:
+        process.wait(timeout=_TUNNEL_WAIT_SECONDS)
+    except Exception:
+        raise AgentError("bastion tunnel cleanup failed") from None
+
+
+@contextmanager
+def _open_bastion_tunnel(
+    bastion: Bastion,
+    keychain_service: str,
+    keychain_account: str,
+    forward: str,
+    *,
+    popen_executor: PopenExecutor = subprocess.Popen,
+) -> Iterator[TunnelProcess]:
+    """Start one encrypted-key, pinned-host bastion forward and always reap it."""
+    with _known_hosts_file(bastion.known_host) as known_hosts_path:
+        with _askpass_program() as askpass_path:
+            process: TunnelProcess | None = None
+            try:
+                argv = (
+                    "/usr/bin/ssh",
+                    "-F",
+                    "/dev/null",
+                    "-NT",
+                    "-o",
+                    "ExitOnForwardFailure=yes",
+                    "-o",
+                    "IdentitiesOnly=yes",
+                    "-o",
+                    "IdentityAgent=none",
+                    "-o",
+                    "StrictHostKeyChecking=yes",
+                    "-o",
+                    f"UserKnownHostsFile={known_hosts_path}",
+                    "-o",
+                    "GlobalKnownHostsFile=/dev/null",
+                    "-o",
+                    "VerifyHostKeyDNS=no",
+                    "-i",
+                    str(bastion.encrypted_key_path),
+                    "-L",
+                    forward,
+                    "-p",
+                    str(bastion.port),
+                    f"{bastion.user}@{bastion.host}",
+                )
+                try:
+                    started = popen_executor(
+                        argv,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        env=_tunnel_environment(
+                            askpass_path, keychain_service, keychain_account
+                        ),
+                        start_new_session=True,
+                    )
+                except Exception:
+                    raise AgentError("bastion tunnel could not be started") from None
+                process = started  # type: ignore[assignment]
+                yield process
+            finally:
+                prior_error = sys.exc_info()[0] is not None
+                if process is not None:
+                    try:
+                        _stop_tunnel(process)
+                    except AgentError:
+                        if not prior_error:
+                            raise
+
+
+def _wait_for_tunnel(
+    process: TunnelProcess,
+    ready: Callable[[], bool],
+    *,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> None:
+    for _attempt in range(_TUNNEL_ATTEMPTS):
+        if process.poll() is not None:
+            raise AgentError("bastion tunnel exited before becoming healthy")
+        if ready():
+            return
+        sleeper(_TUNNEL_RETRY_SECONDS)
+    raise AgentError("bastion tunnel did not become healthy")
+
+
+def _url_endpoint(url: str, operation: str) -> tuple[str, int]:
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme != "http" or parsed.path not in {"", "/"}:
+            raise ValueError
+        host = parsed.hostname
+        port = parsed.port or 80
+    except ValueError:
+        raise AgentError(f"{operation} URL is invalid") from None
+    if not host:
+        raise AgentError(f"{operation} URL is invalid")
+    return host, port
+
+
+class ConnectRoute:
+    """Select direct Connect health or one encrypted, pinned bastion forward."""
+
+    def __init__(
+        self,
+        *,
+        keychain: Keychain | None = None,
+        token: Secret | None = None,
+        account: str | None = None,
+        connect_factory: Callable[..., ConnectClient] = ConnectClient,
+        popen_executor: PopenExecutor = subprocess.Popen,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._keychain = keychain or Keychain()
+        self._token = token
+        self._account = account
+        self._connect_factory = connect_factory
+        self._popen_executor = popen_executor
+        self._sleeper = sleeper
+
+    @contextmanager
+    def open(self, config: AgentConfig) -> Iterator[str]:
+        """Yield the health-checked approved Connect URL and own any tunnel."""
+        account = self._account or self._keychain.local_account()
+        token = self._token or self._keychain.read(
+            config.connect_keychain_service, account
+        )
+        direct = self._connect_factory(
+            config.direct_connect_url, token, vault_name=config.vault_name
+        )
+        try:
+            direct.health()
+        except AgentError:
+            pass
+        else:
+            yield config.direct_connect_url
+            return
+
+        if config.bastion is None:
+            raise AgentError("direct Connect is unavailable and no bastion is configured")
+        direct_host, direct_port = _url_endpoint(
+            config.direct_connect_url, "direct Connect"
+        )
+        tunnel_host, tunnel_port = _url_endpoint(
+            config.tunnel_connect_url, "tunnel Connect"
+        )
+        if tunnel_host != "127.0.0.1":
+            raise AgentError("tunnel Connect URL must use 127.0.0.1")
+        forward = f"{tunnel_host}:{tunnel_port}:{direct_host}:{direct_port}"
+
+        with _open_bastion_tunnel(
+            config.bastion,
+            config.bastion_keychain_service,
+            account,
+            forward,
+            popen_executor=self._popen_executor,
+        ) as process:
+            tunneled = self._connect_factory(
+                config.tunnel_connect_url, token, vault_name=config.vault_name
+            )
+
+            def healthy() -> bool:
+                try:
+                    tunneled.health()
+                except AgentError:
+                    return False
+                return True
+
+            _wait_for_tunnel(process, healthy, sleeper=self._sleeper)
+            yield config.tunnel_connect_url
+
+
+def _allocate_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        return int(reservation.getsockname()[1])
+
+
+def _loopback_ready(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
+def _run_target_connection(
+    target: ManagedTarget,
+    remote_args: Sequence[str],
+    *,
+    host: str,
+    port: int,
+    agent: EphemeralAgent,
+    ssh_executor: SshExecutor,
+    host_key_alias: str | None = None,
+) -> int:
+    with _known_hosts_file(target.known_host) as known_hosts_path:
+        with agent.identity(
+            target.credential_item_id,
+            target.private_field,
+            target.expected_fingerprint,
+        ) as agent_socket:
+            alias_options: tuple[str, ...] = ()
+            if host_key_alias is not None:
+                alias_options = ("-o", f"HostKeyAlias={host_key_alias}")
+            argv = (
+                "/usr/bin/ssh",
+                "-F",
+                "/dev/null",
+                "-o",
+                f"IdentityAgent={agent_socket.socket_path}",
+                "-o",
+                "IdentityFile=none",
+                "-o",
+                "IdentitiesOnly=no",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                f"UserKnownHostsFile={known_hosts_path}",
+                "-o",
+                "GlobalKnownHostsFile=/dev/null",
+                "-o",
+                "VerifyHostKeyDNS=no",
+                *alias_options,
+                "-p",
+                str(port),
+                f"{target.user}@{host}",
+                *remote_args,
+            )
+            try:
+                completed = ssh_executor(argv)
+            except AgentError:
+                raise
+            except Exception:
+                raise AgentError("target SSH could not be started") from None
+            return completed.returncode
+
+
+def run_target_ssh(
+    target: ManagedTarget,
+    remote_args: Sequence[str],
+    *,
+    agent: EphemeralAgent | None = None,
+    ssh_executor: SshExecutor = subprocess.run,
+    bastion: Bastion | None = None,
+    bastion_keychain_service: str | None = None,
+    keychain_account: str | None = None,
+    popen_executor: PopenExecutor = subprocess.Popen,
+    allocate_port: Callable[[], int] = _allocate_loopback_port,
+    forward_ready: Callable[[str, int], bool] = _loopback_ready,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> int:
+    """Run an exact mapped target command with isolated target credentials."""
+    if agent is None:
+        raise AgentError("target SSH requires an ephemeral credential agent")
+    arguments = tuple(remote_args)
+    if not arguments:
+        raise AgentError("target SSH requires a remote command")
+    if target.route == "direct":
+        return _run_target_connection(
+            target,
+            arguments,
+            host=target.host,
+            port=target.port,
+            agent=agent,
+            ssh_executor=ssh_executor,
+        )
+    if target.route != "bastion":
+        raise AgentError("target SSH route is invalid")
+    if (
+        bastion is None
+        or not bastion_keychain_service
+        or not keychain_account
+    ):
+        raise AgentError("bastion target requires configured bastion credentials")
+
+    local_port = allocate_port()
+    if not 1 <= local_port <= 65535:
+        raise AgentError("could not allocate a loopback forwarding port")
+    forward = f"127.0.0.1:{local_port}:{target.host}:{target.port}"
+    with _open_bastion_tunnel(
+        bastion,
+        bastion_keychain_service,
+        keychain_account,
+        forward,
+        popen_executor=popen_executor,
+    ) as process:
+        _wait_for_tunnel(
+            process,
+            lambda: forward_ready("127.0.0.1", local_port),
+            sleeper=sleeper,
+        )
+        return _run_target_connection(
+            target,
+            arguments,
+            host="127.0.0.1",
+            port=local_port,
+            host_key_alias=target.host,
+            agent=agent,
+            ssh_executor=ssh_executor,
+        )
