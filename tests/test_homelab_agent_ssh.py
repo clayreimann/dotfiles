@@ -691,6 +691,19 @@ class ConnectRouteTests(unittest.TestCase):
         self.assertTrue(process.terminated)
         self.assertTrue(process.waited)
 
+    def test_control_master_readiness_check_has_its_own_timeout(self) -> None:
+        with patch.object(
+            ssh_session.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(("ssh", "-O", "check"), 1.0),
+        ) as control_check:
+            ready = ssh_session._control_master_ready(
+                bastion(), Path("/private/tmp/private-control")
+            )
+
+        self.assertFalse(ready)
+        self.assertEqual(1.0, control_check.call_args.kwargs["timeout"])
+
     def test_askpass_reads_the_exact_keychain_item_without_secret_argv_or_environment(self) -> None:
         from homelab_agent import cli
 

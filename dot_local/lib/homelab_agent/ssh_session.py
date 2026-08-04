@@ -52,6 +52,7 @@ ControlReady = Callable[[Bastion, Path], bool]
 _TUNNEL_ATTEMPTS = 20
 _TUNNEL_RETRY_SECONDS = 0.1
 _TUNNEL_WAIT_SECONDS = 5.0
+_CONTROL_CHECK_SECONDS = 1.0
 _ASKPASS_SERVICE_ENV = "HOMELAB_AGENT_ASKPASS_SERVICE"
 _ASKPASS_ACCOUNT_ENV = "HOMELAB_AGENT_ASKPASS_ACCOUNT"
 
@@ -507,6 +508,7 @@ def _control_master_ready(bastion: Bastion, control_path: Path) -> bool:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             env=environment,
+            timeout=_CONTROL_CHECK_SECONDS,
         )
     except Exception:
         return False
