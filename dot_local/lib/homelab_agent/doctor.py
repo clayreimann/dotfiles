@@ -27,6 +27,7 @@ _TOOL_PATHS = {
     "tofu": Path("/opt/homebrew/bin/tofu"),
     "ansible": Path("/opt/homebrew/bin/ansible"),
     "tailscale": Path("/Applications/Tailscale.app/Contents/MacOS/Tailscale"),
+    "tea": Path("/opt/homebrew/bin/tea"),
 }
 
 

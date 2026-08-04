@@ -37,6 +37,22 @@ def valid_document() -> dict[str, object]:
             "private_field": "private_key",
             "expected_fingerprint": "SHA256:hK4mZs4YQvDEf1zgeAOKtER0+eIdPJsDxRzPHlpXpjA",
             "known_host": "[git.4406.madtown.cloud]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGyB56wKbde2dOT+puZOfjpWqTNx3sIDkEjoN1wvUTyT",
+            "api_url": "https://git.4406.madtown.cloud",
+            "api_user": "claude",
+            "api_token_field": "api_token",
+        },
+        "forgejo_automation": {
+            "repository": "homelab/infra",
+            "required_workflows": [
+                "infra-validate.yml",
+                "infra-vm-plan.yml",
+                "infra-lxc-plan.yml",
+                "infra-guest-config-check.yml",
+                "infra-stack-config-check.yml",
+            ],
+            "deploy_workflow": "infra-stacks-deploy.yml",
+            "deploy_ref": "main",
+            "deploy_targets": ["docker01", "monitor01"],
         },
         "bastion": None,
         "targets": [
@@ -66,6 +82,7 @@ def valid_document() -> dict[str, object]:
             "tofu": "1",
             "ansible": "2",
             "tailscale": "1",
+            "tea": "0.14",
         },
     }
 
@@ -80,11 +97,29 @@ class LoadConfigTests(unittest.TestCase):
         path.write_text(json.dumps(document), encoding="utf-8")
         return path
 
-    def test_load_config_builds_typed_forgejo_identity(self) -> None:
+    def test_load_config_builds_typed_forgejo_api_identity_and_automation_policy(self) -> None:
         config = load_config(self.write_config(valid_document()))
 
         self.assertEqual("yznfzgoql7jl4oa6spa7vm3644", config.forgejo.credential_item_id)
         self.assertEqual(2222, config.forgejo.port)
+        self.assertEqual("https://git.4406.madtown.cloud", config.forgejo.api_url)
+        self.assertEqual("claude", config.forgejo.api_user)
+        self.assertEqual("api_token", config.forgejo.api_token_field)
+        self.assertEqual("homelab/infra", config.forgejo_automation.repository)
+        self.assertEqual(
+            (
+                "infra-validate.yml",
+                "infra-vm-plan.yml",
+                "infra-lxc-plan.yml",
+                "infra-guest-config-check.yml",
+                "infra-stack-config-check.yml",
+            ),
+            config.forgejo_automation.required_workflows,
+        )
+        self.assertEqual("infra-stacks-deploy.yml", config.forgejo_automation.deploy_workflow)
+        self.assertEqual("main", config.forgejo_automation.deploy_ref)
+        self.assertEqual(("docker01", "monitor01"), config.forgejo_automation.deploy_targets)
+        self.assertEqual("0.14", config.tools["tea"])
         self.assertEqual("docker01", config.target("docker01").alias)
         self.assertEqual(Path("/Users/clay/Code/homelab/infra"), config.repositories[0].path)
 
@@ -159,6 +194,9 @@ class LoadConfigTests(unittest.TestCase):
             "private_field": "ssh_key",
             "expected_fingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             "known_host": "[git.4406.madtown.cloud]:2222 ssh-ed25519 AAAA",
+            "api_url": "https://other.example",
+            "api_user": "other-user",
+            "api_token_field": "token",
         }
 
         for field, replacement in cases.items():
@@ -170,6 +208,39 @@ class LoadConfigTests(unittest.TestCase):
                     ConfigError, f"forgejo.{field} must match the approved value"
                 ):
                     load_config(self.write_config(document))
+
+    def test_load_config_rejects_unapproved_forgejo_automation_pins(self) -> None:
+        cases: list[tuple[str, object]] = [
+            ("repository", "other/repository"),
+            ("deploy_workflow", "other-deploy.yml"),
+            ("deploy_ref", "release"),
+        ]
+        for index in range(5):
+            workflows = valid_document()["forgejo_automation"]["required_workflows"]  # type: ignore[index]
+            workflows[index] = "other-workflow.yml"  # type: ignore[index]
+            cases.append(("required_workflows", workflows))
+        for index in range(2):
+            targets = valid_document()["forgejo_automation"]["deploy_targets"]  # type: ignore[index]
+            targets[index] = "other-host"  # type: ignore[index]
+            cases.append(("deploy_targets", targets))
+
+        for field, replacement in cases:
+            with self.subTest(field=field, replacement=replacement):
+                document = valid_document()
+                document["forgejo_automation"][field] = replacement  # type: ignore[index]
+
+                with self.assertRaisesRegex(
+                    ConfigError,
+                    f"forgejo_automation.{field} must match the approved value",
+                ):
+                    load_config(self.write_config(document))
+
+    def test_load_config_rejects_unapproved_tea_pin(self) -> None:
+        document = valid_document()
+        document["tools"]["tea"] = "1"  # type: ignore[index]
+
+        with self.assertRaisesRegex(ConfigError, "tools.tea must match the approved value"):
+            load_config(self.write_config(document))
 
     def test_load_config_rejects_unknown_version(self) -> None:
         document = valid_document()

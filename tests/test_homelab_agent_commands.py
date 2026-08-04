@@ -766,6 +766,7 @@ class DoctorAndEnrollmentTests(unittest.TestCase):
                 "tofu": "1",
                 "ansible": "2",
                 "tailscale": "1",
+                "tea": "0.14",
             },
             vault_name="Homelab Secrets",
             connect_keychain_service="connect-service",
@@ -801,6 +802,10 @@ class DoctorAndEnrollmentTests(unittest.TestCase):
         )
         self.assertIn(
             CheckResult("FAIL", "tools", "op", "required executable is unavailable"),
+            results,
+        )
+        self.assertIn(
+            CheckResult("PASS", "tools", "tea", "approved executable is available"),
             results,
         )
 

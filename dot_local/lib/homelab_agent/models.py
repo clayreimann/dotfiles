@@ -18,6 +18,22 @@ class SshIdentity:
 
 
 @dataclass(frozen=True)
+class ForgejoIdentity(SshIdentity):
+    api_url: str
+    api_user: str
+    api_token_field: str
+
+
+@dataclass(frozen=True)
+class ForgejoAutomation:
+    repository: str
+    required_workflows: tuple[str, ...]
+    deploy_workflow: str
+    deploy_ref: str
+    deploy_targets: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ManagedTarget(SshIdentity):
     alias: str
     route: Literal["direct", "bastion"]
@@ -46,7 +62,8 @@ class AgentConfig:
     tunnel_connect_url: str
     connect_keychain_service: str
     bastion_keychain_service: str
-    forgejo: SshIdentity
+    forgejo: ForgejoIdentity
+    forgejo_automation: ForgejoAutomation
     bastion: Bastion | None
     targets: Mapping[str, ManagedTarget]
     repositories: tuple[Repository, ...]

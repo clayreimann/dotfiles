@@ -6,7 +6,15 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from .models import AgentConfig, Bastion, ManagedTarget, Repository, SshIdentity
+from .models import (
+    AgentConfig,
+    Bastion,
+    ForgejoAutomation,
+    ForgejoIdentity,
+    ManagedTarget,
+    Repository,
+    SshIdentity,
+)
 
 
 DEFAULT_CONFIG_PATH = Path(
@@ -25,7 +33,24 @@ _APPROVED_FORGEJO = {
     "private_field": "private_key",
     "expected_fingerprint": "SHA256:hK4mZs4YQvDEf1zgeAOKtER0+eIdPJsDxRzPHlpXpjA",
     "known_host": "[git.4406.madtown.cloud]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGyB56wKbde2dOT+puZOfjpWqTNx3sIDkEjoN1wvUTyT",
+    "api_url": "https://git.4406.madtown.cloud",
+    "api_user": "claude",
+    "api_token_field": "api_token",
 }
+_APPROVED_FORGEJO_AUTOMATION = {
+    "repository": "homelab/infra",
+    "required_workflows": (
+        "infra-validate.yml",
+        "infra-vm-plan.yml",
+        "infra-lxc-plan.yml",
+        "infra-guest-config-check.yml",
+        "infra-stack-config-check.yml",
+    ),
+    "deploy_workflow": "infra-stacks-deploy.yml",
+    "deploy_ref": "main",
+    "deploy_targets": ("docker01", "monitor01"),
+}
+_APPROVED_TEA_VERSION = "0.14"
 _FORBIDDEN_SECRET_KEYS = frozenset({"token", "password", "passphrase", "private_key"})
 _DOCUMENT_KEYS = frozenset(
     {
@@ -34,6 +59,7 @@ _DOCUMENT_KEYS = frozenset(
         "connect",
         "keychain",
         "forgejo",
+        "forgejo_automation",
         "bastion",
         "targets",
         "repositories",
@@ -51,10 +77,14 @@ _IDENTITY_KEYS = frozenset(
         "known_host",
     }
 )
+_FORGEJO_KEYS = _IDENTITY_KEYS | frozenset({"api_url", "api_user", "api_token_field"})
+_FORGEJO_AUTOMATION_KEYS = frozenset(
+    {"repository", "required_workflows", "deploy_workflow", "deploy_ref", "deploy_targets"}
+)
 _TARGET_KEYS = _IDENTITY_KEYS | {"alias", "route"}
 _BASTION_KEYS = frozenset({"host", "port", "user", "encrypted_key_path", "known_host"})
 _REPOSITORY_KEYS = frozenset({"name", "remote", "path"})
-_TOOL_KEYS = frozenset({"python", "git", "op", "tofu", "ansible", "tailscale"})
+_TOOL_KEYS = frozenset({"python", "git", "op", "tofu", "ansible", "tailscale", "tea"})
 
 
 class ConfigError(ValueError):
@@ -126,10 +156,55 @@ def _identity(value: object, path: str) -> SshIdentity:
     )
 
 
-def _validate_forgejo_pins(identity: SshIdentity) -> None:
+def _forgejo_identity(value: object) -> ForgejoIdentity:
+    fields = _object(value, "forgejo", _FORGEJO_KEYS)
+    return ForgejoIdentity(
+        host=_string(fields["host"], "forgejo.host"),
+        port=_port(fields["port"], "forgejo.port"),
+        user=_string(fields["user"], "forgejo.user"),
+        credential_item_id=_string(fields["credential_item_id"], "forgejo.credential_item_id"),
+        private_field=_string(fields["private_field"], "forgejo.private_field"),
+        expected_fingerprint=_string(
+            fields["expected_fingerprint"], "forgejo.expected_fingerprint"
+        ),
+        known_host=_string(fields["known_host"], "forgejo.known_host"),
+        api_url=_string(fields["api_url"], "forgejo.api_url"),
+        api_user=_string(fields["api_user"], "forgejo.api_user"),
+        api_token_field=_string(fields["api_token_field"], "forgejo.api_token_field"),
+    )
+
+
+def _validate_forgejo_pins(identity: ForgejoIdentity) -> None:
     for field, expected in _APPROVED_FORGEJO.items():
         if getattr(identity, field) != expected:
             raise ConfigError(f"forgejo.{field} must match the approved value")
+
+
+def _string_tuple(value: object, path: str) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise ConfigError(f"{path} must be a list")
+    return tuple(_string(entry, f"{path}.{index}") for index, entry in enumerate(value))
+
+
+def _forgejo_automation(value: object) -> ForgejoAutomation:
+    fields = _object(value, "forgejo_automation", _FORGEJO_AUTOMATION_KEYS)
+    automation = ForgejoAutomation(
+        repository=_string(fields["repository"], "forgejo_automation.repository"),
+        required_workflows=_string_tuple(
+            fields["required_workflows"], "forgejo_automation.required_workflows"
+        ),
+        deploy_workflow=_string(fields["deploy_workflow"], "forgejo_automation.deploy_workflow"),
+        deploy_ref=_string(fields["deploy_ref"], "forgejo_automation.deploy_ref"),
+        deploy_targets=_string_tuple(
+            fields["deploy_targets"], "forgejo_automation.deploy_targets"
+        ),
+    )
+    for field, expected in _APPROVED_FORGEJO_AUTOMATION.items():
+        if getattr(automation, field) != expected:
+            raise ConfigError(
+                f"forgejo_automation.{field} must match the approved value"
+            )
+    return automation
 
 
 def _target(value: object, path: str) -> ManagedTarget:
@@ -204,7 +279,12 @@ def _repositories(value: object) -> tuple[Repository, ...]:
 
 def _tools(value: object) -> Mapping[str, str]:
     fields = _object(value, "tools", _TOOL_KEYS)
-    return MappingProxyType({name: _string(fields[name], f"tools.{name}") for name in _TOOL_KEYS})
+    tools = MappingProxyType(
+        {name: _string(fields[name], f"tools.{name}") for name in _TOOL_KEYS}
+    )
+    if tools["tea"] != _APPROVED_TEA_VERSION:
+        raise ConfigError("tools.tea must match the approved value")
+    return tools
 
 
 def load_config(path: Path | None = None) -> AgentConfig:
@@ -243,7 +323,7 @@ def load_config(path: Path | None = None) -> AgentConfig:
     if bastion_keychain_service != _APPROVED_BASTION_KEYCHAIN_SERVICE:
         raise ConfigError("keychain.bastion_service must match the approved value")
 
-    forgejo = _identity(fields["forgejo"], "forgejo")
+    forgejo = _forgejo_identity(fields["forgejo"])
     _validate_forgejo_pins(forgejo)
 
     return AgentConfig(
@@ -253,6 +333,7 @@ def load_config(path: Path | None = None) -> AgentConfig:
         connect_keychain_service=connect_keychain_service,
         bastion_keychain_service=bastion_keychain_service,
         forgejo=forgejo,
+        forgejo_automation=_forgejo_automation(fields["forgejo_automation"]),
         bastion=_bastion(fields["bastion"]),
         targets=_targets(fields["targets"]),
         repositories=_repositories(fields["repositories"]),
