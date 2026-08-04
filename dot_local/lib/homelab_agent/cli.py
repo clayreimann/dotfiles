@@ -44,7 +44,7 @@ Approved commands (Homelab Secrets only):
   vault list
   vault get Homelab Secrets
   item list
-  item get ITEM_UUID
+  item get ITEM_IDENTIFIER
   item create -                 # JSON object on stdin
   item edit ITEM_UUID            # JSON object on stdin
   read op://Homelab Secrets/ITEM/FIELD
