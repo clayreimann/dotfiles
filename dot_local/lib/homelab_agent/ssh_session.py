@@ -31,10 +31,9 @@ class AgentSocket:
 
 _AGENT_ASSIGNMENT = re.compile(r"^(SSH_AUTH_SOCK|SSH_AGENT_PID)=([^;]+);")
 _AGENT_ENVIRONMENT_NAMES = ("SSH_AUTH_SOCK", "SSH_AGENT_PID")
-_OPTIONS_WITH_ARGUMENT = frozenset(
-    {"-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w"}
-)
-_FLAG_OPTIONS = frozenset({"-4", "-6", "-A", "-a", "-C", "-f", "-G", "-g", "-K", "-k", "-M", "-N", "-n", "-q", "-s", "-T", "-t", "-V", "-X", "-x", "-y"})
+_GIT_SSH_OPTIONS_WITH_ARGUMENT = frozenset({"-l", "-o", "-p"})
+_GIT_SSH_FLAGS = frozenset({"-G", "-q", "-T"})
+_FORBIDDEN_CALLER_OPTIONS = frozenset({"-D", "-I", "-J", "-L", "-R", "-W", "-i"})
 _PINNED_SECURITY_OPTIONS = frozenset(
     {
         "identityagent",
@@ -47,6 +46,26 @@ _PINNED_SECURITY_OPTIONS = frozenset(
         "verifyhostkeydns",
     }
 )
+_FORBIDDEN_CALLER_SSH_OPTIONS = frozenset(
+    {
+        "clearallforwardings",
+        "dynamicforward",
+        "exitonforwardfailure",
+        "forwardagent",
+        "identityagent",
+        "identityfile",
+        "identitiesonly",
+        "localforward",
+        "pkcs11provider",
+        "proxycommand",
+        "proxyjump",
+        "proxyusefdpass",
+        "remoteforward",
+        "securitykeyprovider",
+        "stdioforward",
+    }
+)
+_SSH_ENVIRONMENT_PRESERVE = ("GIT_PROTOCOL",)
 SshExecutor = Callable[..., subprocess.CompletedProcess[str]]
 PopenExecutor = Callable[..., object]
 ControlReady = Callable[[Bastion, Path], bool]
@@ -200,10 +219,11 @@ def _fingerprint(output: str) -> str:
     return fields[1]
 
 
-def _validate_destination(identity: SshIdentity, remote_args: Sequence[str]) -> None:
-    """Fail closed unless Git's effective SSH destination is the pinned Forgejo user/host."""
+def _validate_destination(identity: SshIdentity, remote_args: Sequence[str]) -> tuple[str, ...]:
+    """Return the safe Git SSH request for the pinned Forgejo destination."""
     index = 0
     arguments = tuple(remote_args)
+    accepted: list[str] = []
     while index < len(arguments):
         argument = arguments[index]
         if argument == "--":
@@ -211,17 +231,26 @@ def _validate_destination(identity: SshIdentity, remote_args: Sequence[str]) -> 
             break
         if not argument.startswith("-") or argument == "-":
             break
-        if argument in _OPTIONS_WITH_ARGUMENT:
+        if argument in _FORBIDDEN_CALLER_OPTIONS or (
+            len(argument) > 2 and argument[:2] in _FORBIDDEN_CALLER_OPTIONS
+        ):
+            raise AgentError("SSH invocation contains a forbidden credential, proxy, or forwarding option")
+        if argument in _GIT_SSH_OPTIONS_WITH_ARGUMENT:
             if index + 1 >= len(arguments):
                 raise AgentError("SSH invocation is missing an option value")
-            _validate_destination_option(identity, argument, arguments[index + 1])
+            accepted.extend(
+                _validate_destination_option(identity, argument, arguments[index + 1])
+            )
             index += 2
             continue
         if len(argument) > 2 and argument[:2] in {"-l", "-p", "-o"}:
-            _validate_destination_option(identity, argument[:2], argument[2:])
+            accepted.extend(
+                _validate_destination_option(identity, argument[:2], argument[2:])
+            )
             index += 1
             continue
-        if argument in _FLAG_OPTIONS or re.fullmatch(r"-v+", argument):
+        if argument in _GIT_SSH_FLAGS or re.fullmatch(r"-v+", argument):
+            accepted.append(argument)
             index += 1
             continue
         raise AgentError("SSH invocation contains an unsupported option")
@@ -232,22 +261,29 @@ def _validate_destination(identity: SshIdentity, remote_args: Sequence[str]) -> 
         raise AgentError("SSH destination does not match configured identity")
     if user != identity.user or host != identity.host:
         raise AgentError("SSH destination does not match configured identity")
+    return (*accepted, arguments[index], *arguments[index + 1 :])
 
 
-def _validate_destination_option(identity: SshIdentity, option: str, value: str) -> None:
+def _validate_destination_option(
+    identity: SshIdentity, option: str, value: str
+) -> tuple[str, ...]:
     if not value:
         raise AgentError("SSH invocation is missing an option value")
-    if option == "-l" and value != identity.user:
-        raise AgentError("SSH destination does not match configured identity")
-    if option == "-p" and value != str(identity.port):
-        raise AgentError("SSH destination does not match configured identity")
-    if option == "-F":
-        raise AgentError("SSH invocation contains an unsupported option")
+    if option == "-l":
+        if value != identity.user:
+            raise AgentError("SSH destination does not match configured identity")
+        return ()
+    if option == "-p":
+        if value != str(identity.port):
+            raise AgentError("SSH destination does not match configured identity")
+        return ()
     if option != "-o":
-        return
+        raise AgentError("SSH invocation contains an unsupported option")
     name, option_value = _ssh_option(value)
     if name in _PINNED_SECURITY_OPTIONS:
         raise AgentError("SSH invocation overrides pinned security settings")
+    if name in _FORBIDDEN_CALLER_SSH_OPTIONS:
+        raise AgentError("SSH invocation contains a forbidden credential, proxy, or forwarding option")
     expected = {
         "user": identity.user,
         "hostname": identity.host,
@@ -255,6 +291,20 @@ def _validate_destination_option(identity: SshIdentity, option: str, value: str)
     }.get(name)
     if expected is not None and option_value != expected:
         raise AgentError("SSH destination does not match configured identity")
+    if expected is not None:
+        return ()
+    if name != "sendenv" or option_value != "GIT_PROTOCOL":
+        raise AgentError("SSH invocation contains an unsupported option")
+    return ("-o", "SendEnv=GIT_PROTOCOL")
+
+
+def _pinned_ssh_environment() -> dict[str, str]:
+    """Pass Git's protocol marker without inheriting local SSH state."""
+    return {
+        name: os.environ[name]
+        for name in _SSH_ENVIRONMENT_PRESERVE
+        if name in os.environ
+    }
 
 
 def _ssh_option(value: str) -> tuple[str, str]:
@@ -288,7 +338,7 @@ def run_pinned_ssh(
     """
     if agent is None:
         raise AgentError("pinned SSH requires an ephemeral credential agent")
-    _validate_destination(identity, remote_args)
+    git_args = _validate_destination(identity, remote_args)
 
     known_hosts_fd, known_hosts_name = tempfile.mkstemp(prefix="homelab-agent-known-hosts-")
     known_hosts_path = Path(known_hosts_name)
@@ -321,9 +371,9 @@ def run_pinned_ssh(
                 "GlobalKnownHostsFile=/dev/null",
                 "-p",
                 str(identity.port),
-                *remote_args,
+                *git_args,
             )
-            completed = ssh_executor(argv)
+            completed = ssh_executor(argv, env=_pinned_ssh_environment())
             return completed.returncode
     finally:
         try:

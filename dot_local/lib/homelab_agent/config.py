@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -14,6 +13,10 @@ DEFAULT_CONFIG_PATH = Path(
     "/Users/clay/Code/homelab/infra/config/mac-agent/credential-map.json"
 )
 _APPROVED_VAULT_NAME = "Homelab Secrets"
+_APPROVED_DIRECT_CONNECT_URL = "http://192.168.42.253:8080"
+_APPROVED_TUNNEL_CONNECT_URL = "http://127.0.0.1:18080"
+_APPROVED_CONNECT_KEYCHAIN_SERVICE = "com.4406.homelab-agent.connect-token"
+_APPROVED_BASTION_KEYCHAIN_SERVICE = "com.4406.homelab-agent.bastion-passphrase"
 _APPROVED_FORGEJO = {
     "host": "git.4406.madtown.cloud",
     "port": 2222,
@@ -59,10 +62,7 @@ class ConfigError(ValueError):
 
 
 def _config_path(path: Path | None) -> Path:
-    if path is not None:
-        return path
-    override = os.environ.get("HOMELAB_AGENT_CONFIG")
-    return Path(override) if override else DEFAULT_CONFIG_PATH
+    return path if path is not None else DEFAULT_CONFIG_PATH
 
 
 def _read_document(path: Path) -> dict[str, Any]:
@@ -226,19 +226,32 @@ def load_config(path: Path | None = None) -> AgentConfig:
     if vault_name != _APPROVED_VAULT_NAME:
         raise ConfigError("vault.name must match the approved value")
 
+    direct_connect_url = _string(connect["direct_url"], "connect.direct_url")
+    if direct_connect_url != _APPROVED_DIRECT_CONNECT_URL:
+        raise ConfigError("connect.direct_url must match the approved value")
+    tunnel_connect_url = _string(connect["tunnel_url"], "connect.tunnel_url")
+    if tunnel_connect_url != _APPROVED_TUNNEL_CONNECT_URL:
+        raise ConfigError("connect.tunnel_url must match the approved value")
+    connect_keychain_service = _string(
+        keychain["connect_service"], "keychain.connect_service"
+    )
+    if connect_keychain_service != _APPROVED_CONNECT_KEYCHAIN_SERVICE:
+        raise ConfigError("keychain.connect_service must match the approved value")
+    bastion_keychain_service = _string(
+        keychain["bastion_service"], "keychain.bastion_service"
+    )
+    if bastion_keychain_service != _APPROVED_BASTION_KEYCHAIN_SERVICE:
+        raise ConfigError("keychain.bastion_service must match the approved value")
+
     forgejo = _identity(fields["forgejo"], "forgejo")
     _validate_forgejo_pins(forgejo)
 
     return AgentConfig(
         vault_name=vault_name,
-        direct_connect_url=_string(connect["direct_url"], "connect.direct_url"),
-        tunnel_connect_url=_string(connect["tunnel_url"], "connect.tunnel_url"),
-        connect_keychain_service=_string(
-            keychain["connect_service"], "keychain.connect_service"
-        ),
-        bastion_keychain_service=_string(
-            keychain["bastion_service"], "keychain.bastion_service"
-        ),
+        direct_connect_url=direct_connect_url,
+        tunnel_connect_url=tunnel_connect_url,
+        connect_keychain_service=connect_keychain_service,
+        bastion_keychain_service=bastion_keychain_service,
         forgejo=forgejo,
         bastion=_bastion(fields["bastion"]),
         targets=_targets(fields["targets"]),

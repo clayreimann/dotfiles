@@ -88,11 +88,24 @@ class LoadConfigTests(unittest.TestCase):
         self.assertEqual("docker01", config.target("docker01").alias)
         self.assertEqual(Path("/Users/clay/Code/homelab/infra"), config.repositories[0].path)
 
-    def test_load_config_uses_environment_override_when_path_is_omitted(self) -> None:
+    def test_load_config_ignores_ambient_environment_override_when_path_is_omitted(self) -> None:
+        approved_path = self.write_config(valid_document())
+        attacker_document = valid_document()
+        attacker_document["vault"]["name"] = "Other vault"  # type: ignore[index]
+        attacker_path = Path(self.tempdir.name) / "attacker-map.json"
+        attacker_path.write_text(json.dumps(attacker_document), encoding="utf-8")
+
+        with patch("homelab_agent.config.DEFAULT_CONFIG_PATH", approved_path), patch.dict(
+            os.environ, {"HOMELAB_AGENT_CONFIG": str(attacker_path)}
+        ):
+            config = load_config()
+
+        self.assertEqual("Homelab Secrets", config.vault_name)
+
+    def test_load_config_allows_an_explicit_test_path(self) -> None:
         path = self.write_config(valid_document())
 
-        with patch.dict(os.environ, {"HOMELAB_AGENT_CONFIG": str(path)}):
-            config = load_config()
+        config = load_config(path)
 
         self.assertEqual("Homelab Secrets", config.vault_name)
 
@@ -104,6 +117,38 @@ class LoadConfigTests(unittest.TestCase):
             ConfigError, "vault.name must match the approved value"
         ):
             load_config(self.write_config(document))
+
+    def test_load_config_rejects_unapproved_connect_endpoints(self) -> None:
+        cases = {
+            "direct_url": "http://other-connect.example:8080",
+            "tunnel_url": "http://127.0.0.1:28080",
+        }
+
+        for field, replacement in cases.items():
+            with self.subTest(field=field):
+                document = valid_document()
+                document["connect"][field] = replacement  # type: ignore[index]
+
+                with self.assertRaisesRegex(
+                    ConfigError, f"connect.{field} must match the approved value"
+                ):
+                    load_config(self.write_config(document))
+
+    def test_load_config_rejects_unapproved_keychain_service_names(self) -> None:
+        cases = {
+            "connect_service": "com.example.unapproved-connect-token",
+            "bastion_service": "com.example.unapproved-bastion-passphrase",
+        }
+
+        for field, replacement in cases.items():
+            with self.subTest(field=field):
+                document = valid_document()
+                document["keychain"][field] = replacement  # type: ignore[index]
+
+                with self.assertRaisesRegex(
+                    ConfigError, f"keychain.{field} must match the approved value"
+                ):
+                    load_config(self.write_config(document))
 
     def test_load_config_rejects_unapproved_forgejo_pins(self) -> None:
         cases = {

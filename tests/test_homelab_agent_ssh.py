@@ -465,6 +465,96 @@ class PinnedForgejoSshTests(unittest.TestCase):
         self.assertEqual([], fake_process.calls)
         self.assertEqual([], ssh_calls)
 
+    def test_identity_proxy_and_forwarding_options_stop_before_starting_an_agent_or_ssh(self) -> None:
+        blocked = {
+            "separate identity file": ["-i", "/tmp/other-key"],
+            "attached identity file": ["-i/tmp/other-key"],
+            "separate PKCS11 provider": ["-I", "/tmp/provider"],
+            "attached PKCS11 provider": ["-I/tmp/provider"],
+            "separate proxy jump": ["-J", "jump.example"],
+            "attached proxy jump": ["-Jjump.example"],
+            "separate local forward": ["-L", "10022:git.example:22"],
+            "attached local forward": ["-L10022:git.example:22"],
+            "separate remote forward": ["-R", "10022:git.example:22"],
+            "attached remote forward": ["-R10022:git.example:22"],
+            "separate dynamic forward": ["-D", "10022"],
+            "attached dynamic forward": ["-D10022"],
+            "separate stdio forward": ["-W", "git.example:22"],
+            "attached stdio forward": ["-Wgit.example:22"],
+        }
+        for name, options in blocked.items():
+            with self.subTest(name=name):
+                fake_process = FakeProcess([])
+                ssh_calls: list[tuple[str, ...]] = []
+
+                with self.assertRaisesRegex(AgentError, "forbidden credential, proxy, or forwarding option"):
+                    run_pinned_ssh(
+                        identity(),
+                        [*options, "git@git.4406.madtown.cloud", "git-upload-pack 'homelab/infra.git'"],
+                        agent=EphemeralAgent(FakeConnect(), Runner(fake_process)),
+                        ssh_executor=lambda argv: ssh_calls.append(argv),  # type: ignore[return-value]
+                    )
+
+                self.assertEqual([], fake_process.calls)
+                self.assertEqual([], ssh_calls)
+
+    def test_identity_proxy_and_forwarding_o_options_stop_before_starting_an_agent_or_ssh(self) -> None:
+        blocked = {
+            "attached identity provider": ["-oPKCS11Provider=/tmp/provider"],
+            "separate security key provider": ["-o", "SecurityKeyProvider /tmp/provider"],
+            "attached proxy command": ["-oProxyCommand=/usr/bin/false"],
+            "separate proxy jump": ["-o", "ProxyJump jump.example"],
+            "attached proxy file descriptor": ["-oProxyUseFdpass=yes"],
+            "separate local forward": ["-o", "LocalForward 10022 git.example:22"],
+            "attached remote forward": ["-oRemoteForward=10022:git.example:22"],
+            "separate dynamic forward": ["-o", "DynamicForward 10022"],
+            "attached stdio forward": ["-oStdioForward=git.example:22"],
+            "separate agent forward": ["-o", "ForwardAgent yes"],
+        }
+        for name, options in blocked.items():
+            with self.subTest(name=name):
+                fake_process = FakeProcess([])
+                ssh_calls: list[tuple[str, ...]] = []
+
+                with self.assertRaisesRegex(AgentError, "forbidden credential, proxy, or forwarding option"):
+                    run_pinned_ssh(
+                        identity(),
+                        [*options, "git@git.4406.madtown.cloud", "git-upload-pack 'homelab/infra.git'"],
+                        agent=EphemeralAgent(FakeConnect(), Runner(fake_process)),
+                        ssh_executor=lambda argv: ssh_calls.append(argv),  # type: ignore[return-value]
+                    )
+
+                self.assertEqual([], fake_process.calls)
+                self.assertEqual([], ssh_calls)
+
+    def test_final_ssh_receives_only_git_protocol_from_the_ambient_environment(self) -> None:
+        fake_process = FakeProcess(agent_responses())
+        observed: dict[str, object] = {}
+
+        def ssh_executor(argv: tuple[str, ...], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            observed["environment"] = kwargs["env"]
+            return completed(argv)
+
+        with patch.dict(
+            os.environ,
+            {
+                "GIT_PROTOCOL": "version=2",
+                "HOME": "/Users/clay",
+                "SSH_AUTH_SOCK": "/tmp/personal-agent.sock",
+                "SSH_ASKPASS": "/tmp/personal-askpass",
+            },
+            clear=True,
+        ):
+            rc = run_pinned_ssh(
+                identity(),
+                ["git@git.4406.madtown.cloud", "git-upload-pack 'homelab/infra.git'"],
+                agent=EphemeralAgent(FakeConnect(), Runner(fake_process)),
+                ssh_executor=ssh_executor,
+            )
+
+        self.assertEqual(0, rc)
+        self.assertEqual({"GIT_PROTOCOL": "version=2"}, observed["environment"])
+
     def test_loaded_agent_key_is_actually_offered(self) -> None:
         fake_process = FakeProcess(agent_responses())
         observed: dict[str, object] = {}
@@ -507,8 +597,15 @@ class PinnedForgejoSshTests(unittest.TestCase):
         self.assertEqual("2222", argv[argv.index("-p") + 1])
         self.assertEqual("/dev/null", argv[argv.index("-F") + 1])
         self.assertEqual(
-            git_args,
-            list(argv[-len(git_args):]),
+            [
+                "-o", "SendEnv=GIT_PROTOCOL",
+                "-o", "SendEnv=GIT_PROTOCOL",
+                "-o", "SendEnv=GIT_PROTOCOL",
+                "-vv",
+                "git@git.4406.madtown.cloud",
+                "git-upload-pack 'homelab/infra.git'",
+            ],
+            list(argv[-9:]),
         )
         self.assertEqual(identity().known_host + "\n", observed["known_hosts"])
         self.assertEqual(0o600, observed["known_hosts_mode"])

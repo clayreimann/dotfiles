@@ -139,7 +139,9 @@ def _forgejo_probe(client: ConnectClient, identity: Any) -> int:
         identity,
         ("-T", f"{identity.user}@{identity.host}"),
         agent=agent,
-        ssh_executor=lambda argv: subprocess.run(argv, text=True, capture_output=True),
+        ssh_executor=lambda argv, **kwargs: subprocess.run(
+            argv, text=True, capture_output=True, **kwargs
+        ),
     )
 
 

@@ -907,6 +907,67 @@ class DoctorAndEnrollmentTests(unittest.TestCase):
         self.assertEqual("authentication was not attempted after host-trust failure", authorization.detail)
         self.assertNotIn("rejected", authorization.detail)
 
+    def test_live_doctor_default_forgejo_probe_forwards_pinned_environment(self) -> None:
+        from homelab_agent import doctor
+
+        class Route:
+            @contextmanager
+            def open(self, _config: object):
+                yield "http://connect.example:8080"
+
+        class Client:
+            def health(self) -> None:
+                return None
+
+        observed: list[dict[str, object]] = []
+
+        def pinned_ssh(
+            _identity: object,
+            _remote_args: object,
+            *,
+            agent: object,
+            ssh_executor: object,
+        ) -> int:
+            self.assertIsNotNone(agent)
+            completed = ssh_executor(  # type: ignore[operator]
+                ("/usr/bin/ssh", "-T"), env={"SSH_AUTH_SOCK": "/tmp/ephemeral-agent.sock"}
+            )
+            return completed.returncode  # type: ignore[union-attr]
+
+        def executor(argv: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            observed.append(dict(kwargs))
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+
+        with patch.object(doctor, "run_pinned_ssh", side_effect=pinned_ssh), patch.object(
+            doctor.subprocess, "run", side_effect=executor
+        ):
+            results = run_doctor(
+                live=True,
+                load=lambda: self.config,
+                executable_exists=lambda _path: True,
+                python_version=lambda: "3.12.7",
+                keychain_factory=lambda: self.keychain,
+                route_factory=lambda **_kwargs: Route(),
+                connect_factory=lambda *_args, **_kwargs: Client(),
+                connect_scope_checker=lambda *_args, **_kwargs: True,
+                credential_validator=lambda *_args, **_kwargs: True,
+                host_trust_probe=lambda _identity: True,
+                repository_inspector=lambda _repository: True,
+            )
+
+        authorization = next(result for result in results if result.category == "server-authorization")
+        self.assertEqual("PASS", authorization.status)
+        self.assertEqual(
+            [
+                {
+                    "text": True,
+                    "capture_output": True,
+                    "env": {"SSH_AUTH_SOCK": "/tmp/ephemeral-agent.sock"},
+                }
+            ],
+            observed,
+        )
+
     def test_presented_host_key_probe_compares_exact_pinned_public_line(self) -> None:
         from homelab_agent import doctor
 
