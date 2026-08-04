@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -49,16 +50,21 @@ _PINNED_SECURITY_OPTIONS = frozenset(
 SshExecutor = Callable[..., subprocess.CompletedProcess[str]]
 PopenExecutor = Callable[..., object]
 ControlReady = Callable[[Bastion, Path], bool]
+GroupSignaler = Callable[[int, signal.Signals], None]
 _TUNNEL_ATTEMPTS = 20
 _TUNNEL_RETRY_SECONDS = 0.1
 _TUNNEL_WAIT_SECONDS = 5.0
 _CONTROL_CHECK_SECONDS = 1.0
 _ASKPASS_SERVICE_ENV = "HOMELAB_AGENT_ASKPASS_SERVICE"
 _ASKPASS_ACCOUNT_ENV = "HOMELAB_AGENT_ASKPASS_ACCOUNT"
+_APPROVED_BASTION_KEY_PATH = Path(
+    "/Users/clay/.ssh/homelab_bastion_bootstrap"
+)
 
 
 class TunnelProcess(Protocol):
     returncode: int | None
+    pid: int
 
     def poll(self) -> int | None: ...
 
@@ -366,35 +372,48 @@ def _tunnel_environment(
     return environment
 
 
-def _stop_tunnel(process: TunnelProcess) -> None:
-    running = True
+def _validate_bastion_key_path(bastion: Bastion | None) -> None:
+    if (
+        bastion is not None
+        and bastion.encrypted_key_path != _APPROVED_BASTION_KEY_PATH
+    ):
+        raise AgentError("bastion key path is not approved")
+
+
+def _stop_tunnel(
+    process: TunnelProcess,
+    process_group: int,
+    *,
+    group_signaler: GroupSignaler = os.killpg,
+) -> None:
+    group_missing = False
     try:
-        running = process.poll() is None
+        group_signaler(process_group, signal.SIGTERM)
+    except ProcessLookupError:
+        group_missing = True
     except Exception:
         pass
 
-    terminate_failed = False
-    if running:
-        try:
-            process.terminate()
-        except Exception:
-            terminate_failed = True
+    leader_reaped = False
+    try:
+        process.wait(timeout=_TUNNEL_WAIT_SECONDS)
+        leader_reaped = True
+    except Exception:
+        pass
 
-    if not terminate_failed:
+    if not group_missing:
         try:
-            process.wait(timeout=_TUNNEL_WAIT_SECONDS)
-            return
+            group_signaler(process_group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         except Exception:
             pass
 
-    try:
-        process.kill()
-    except Exception:
-        pass
-    try:
-        process.wait(timeout=_TUNNEL_WAIT_SECONDS)
-    except Exception:
-        raise AgentError("bastion tunnel cleanup failed") from None
+    if not leader_reaped:
+        try:
+            process.wait(timeout=_TUNNEL_WAIT_SECONDS)
+        except Exception:
+            raise AgentError("bastion tunnel cleanup failed") from None
 
 
 @contextmanager
@@ -405,12 +424,15 @@ def _open_bastion_tunnel(
     forward: str,
     *,
     popen_executor: PopenExecutor = subprocess.Popen,
+    group_signaler: GroupSignaler = os.killpg,
 ) -> Iterator[tuple[TunnelProcess, Path]]:
     """Start one encrypted-key, pinned-host bastion forward and always reap it."""
+    _validate_bastion_key_path(bastion)
     with _known_hosts_file(bastion.known_host) as known_hosts_path:
         with _askpass_program() as askpass_path:
             control_path = askpass_path.parent / "control"
             process: TunnelProcess | None = None
+            process_group: int | None = None
             try:
                 argv = (
                     "/usr/bin/ssh",
@@ -426,6 +448,16 @@ def _open_bastion_tunnel(
                     "IdentitiesOnly=yes",
                     "-o",
                     "IdentityAgent=none",
+                    "-o",
+                    "PreferredAuthentications=publickey",
+                    "-o",
+                    "PasswordAuthentication=no",
+                    "-o",
+                    "KbdInteractiveAuthentication=no",
+                    "-o",
+                    "ChallengeResponseAuthentication=no",
+                    "-o",
+                    "BatchMode=no",
                     "-o",
                     "StrictHostKeyChecking=yes",
                     "-o",
@@ -456,12 +488,19 @@ def _open_bastion_tunnel(
                 except Exception:
                     raise AgentError("bastion tunnel could not be started") from None
                 process = started  # type: ignore[assignment]
+                process_group = process.pid
+                if process_group <= 0:
+                    raise AgentError("bastion tunnel returned an invalid process id")
                 yield process, control_path
             finally:
                 prior_error = sys.exc_info()[0] is not None
-                if process is not None:
+                if process is not None and process_group is not None:
                     try:
-                        _stop_tunnel(process)
+                        _stop_tunnel(
+                            process,
+                            process_group,
+                            group_signaler=group_signaler,
+                        )
                     except AgentError:
                         if not prior_error:
                             raise
@@ -540,6 +579,7 @@ class ConnectRoute:
         account: str | None = None,
         connect_factory: Callable[..., ConnectClient] = ConnectClient,
         popen_executor: PopenExecutor = subprocess.Popen,
+        group_signaler: GroupSignaler = os.killpg,
         control_ready: ControlReady = _control_master_ready,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -548,12 +588,14 @@ class ConnectRoute:
         self._account = account
         self._connect_factory = connect_factory
         self._popen_executor = popen_executor
+        self._group_signaler = group_signaler
         self._control_ready = control_ready
         self._sleeper = sleeper
 
     @contextmanager
     def open(self, config: AgentConfig) -> Iterator[str]:
         """Yield the health-checked approved Connect URL and own any tunnel."""
+        _validate_bastion_key_path(config.bastion)
         account = self._account or self._keychain.local_account()
         token = self._token or self._keychain.read(
             config.connect_keychain_service, account
@@ -587,6 +629,7 @@ class ConnectRoute:
             account,
             forward,
             popen_executor=self._popen_executor,
+            group_signaler=self._group_signaler,
         ) as (process, control_path):
             tunneled = self._connect_factory(
                 config.tunnel_connect_url, token, vault_name=config.vault_name
@@ -652,6 +695,16 @@ def _run_target_connection(
                 "-o",
                 "IdentitiesOnly=no",
                 "-o",
+                "PreferredAuthentications=publickey",
+                "-o",
+                "PasswordAuthentication=no",
+                "-o",
+                "KbdInteractiveAuthentication=no",
+                "-o",
+                "ChallengeResponseAuthentication=no",
+                "-o",
+                "BatchMode=yes",
+                "-o",
                 "StrictHostKeyChecking=yes",
                 "-o",
                 f"UserKnownHostsFile={known_hosts_path}",
@@ -684,6 +737,7 @@ def run_target_ssh(
     bastion_keychain_service: str | None = None,
     keychain_account: str | None = None,
     popen_executor: PopenExecutor = subprocess.Popen,
+    group_signaler: GroupSignaler = os.killpg,
     control_ready: ControlReady = _control_master_ready,
     allocate_port: Callable[[], int] = _allocate_loopback_port,
     forward_ready: Callable[[str, int], bool] = _loopback_ready,
@@ -723,6 +777,7 @@ def run_target_ssh(
         keychain_account,
         forward,
         popen_executor=popen_executor,
+        group_signaler=group_signaler,
     ) as (process, control_path):
         _wait_for_tunnel(
             process,

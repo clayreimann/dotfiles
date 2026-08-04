@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import io
+import signal
 import stat
 import subprocess
 import sys
@@ -124,8 +125,9 @@ class FakeKeychain:
 
 
 class FakeTunnelProcess:
-    def __init__(self, *, returncode: int | None = None) -> None:
+    def __init__(self, *, returncode: int | None = None, pid: int = 6060) -> None:
         self.returncode = returncode
+        self.pid = pid
         self.terminated = False
         self.killed = False
         self.waited = False
@@ -207,6 +209,23 @@ def agent_responses(*, fingerprint: str = FINGERPRINT) -> list[subprocess.Comple
         completed(("/usr/bin/ssh-keygen", "-lf", "-", "-E", "sha256"), f"256 {fingerprint} forgejo-agent (ED25519)\n"),
         completed(("/usr/bin/ssh-agent", "-k")),
     ]
+
+
+def assert_publickey_only(
+    case: unittest.TestCase, argv: tuple[str, ...], *, batch_mode: str
+) -> None:
+    for option in (
+        "PreferredAuthentications=publickey",
+        "PasswordAuthentication=no",
+        "KbdInteractiveAuthentication=no",
+        "ChallengeResponseAuthentication=no",
+        f"BatchMode={batch_mode}",
+    ):
+        case.assertIn(option, argv)
+
+
+def ignore_group_signal(_process_group: int, _sent: signal.Signals) -> None:
+    pass
 
 
 class EphemeralAgentTests(unittest.TestCase):
@@ -538,6 +557,7 @@ class ConnectRouteTests(unittest.TestCase):
             keychain=keychain,
             connect_factory=connect,
             popen_executor=popen,
+            group_signaler=ignore_group_signal,
             control_ready=lambda _bastion, _path: True,
             sleeper=lambda _seconds: None,
         )
@@ -568,6 +588,7 @@ class ConnectRouteTests(unittest.TestCase):
             keychain=keychain,
             connect_factory=connect,
             popen_executor=popen,
+            group_signaler=ignore_group_signal,
             control_ready=lambda _bastion, _path: True,
             sleeper=lambda _seconds: None,
         )
@@ -587,6 +608,7 @@ class ConnectRouteTests(unittest.TestCase):
             self.assertIn("ExitOnForwardFailure=yes", argv)
             self.assertIn("IdentitiesOnly=yes", argv)
             self.assertIn("IdentityAgent=none", argv)
+            assert_publickey_only(self, argv, batch_mode="no")
             self.assertIn("127.0.0.1:18080:192.168.42.253:8080", argv)
             self.assertIn(str(bastion().encrypted_key_path), argv)
             self.assertIn("StrictHostKeyChecking=yes", argv)
@@ -606,8 +628,37 @@ class ConnectRouteTests(unittest.TestCase):
             ],
             keychain.calls,
         )
-        self.assertTrue(process.terminated)
         self.assertTrue(process.waited)
+
+    def test_unapproved_bastion_key_path_stops_before_askpass_or_ssh(self) -> None:
+        config = route_config()
+        config.bastion = Bastion(
+            host=bastion().host,
+            port=bastion().port,
+            user=bastion().user,
+            encrypted_key_path=Path("/Users/clay/.ssh/other-key"),
+            known_host=bastion().known_host,
+        )
+        keychain = FakeKeychain()
+        connect = FakeHealthFactory(
+            {"http://192.168.42.253:8080": [AgentError("direct refused")]}
+        )
+        popen = FakePopen([])
+        route = ssh_session.ConnectRoute(
+            keychain=keychain,
+            connect_factory=connect,
+            popen_executor=popen,
+            group_signaler=ignore_group_signal,
+            control_ready=lambda _bastion, _path: True,
+            sleeper=lambda _seconds: None,
+        )
+
+        with self.assertRaisesRegex(AgentError, "bastion key path is not approved"):
+            with route.open(config):
+                self.fail("unapproved bootstrap path must not start a tunnel")
+
+        self.assertEqual([], popen.calls)
+        self.assertEqual([], keychain.calls)
 
     def test_tunnel_startup_failure_is_redacted_and_removes_temporary_files(self) -> None:
         keychain = FakeKeychain()
@@ -619,6 +670,7 @@ class ConnectRouteTests(unittest.TestCase):
             keychain=keychain,
             connect_factory=connect,
             popen_executor=popen,
+            group_signaler=ignore_group_signal,
             control_ready=lambda _bastion, _path: True,
             sleeper=lambda _seconds: None,
         )
@@ -648,6 +700,7 @@ class ConnectRouteTests(unittest.TestCase):
             keychain=keychain,
             connect_factory=connect,
             popen_executor=popen,
+            group_signaler=ignore_group_signal,
             control_ready=lambda _bastion, _path: True,
             sleeper=lambda _seconds: None,
         )
@@ -677,6 +730,7 @@ class ConnectRouteTests(unittest.TestCase):
             keychain=keychain,
             connect_factory=connect,
             popen_executor=FakePopen([process]),
+            group_signaler=ignore_group_signal,
             control_ready=lambda _bastion, _path: False,
             sleeper=lambda _seconds: None,
         )
@@ -688,7 +742,6 @@ class ConnectRouteTests(unittest.TestCase):
         self.assertEqual(
             ["http://192.168.42.253:8080"], connect.health_calls
         )
-        self.assertTrue(process.terminated)
         self.assertTrue(process.waited)
 
     def test_control_master_readiness_check_has_its_own_timeout(self) -> None:
@@ -755,24 +808,31 @@ class ConnectRouteTests(unittest.TestCase):
 
                 self.assertEqual([("local_account",)], keychain.calls)
 
-    def test_cleanup_kills_and_reaps_when_graceful_termination_raises(self) -> None:
-        class UncooperativeProcess(FakeTunnelProcess):
-            def terminate(self) -> None:
-                self.terminated = True
-                raise OSError("terminate failed")
+    def test_cleanup_signals_the_entire_group_and_reaps_after_wait_timeout(self) -> None:
+        class SlowProcess(FakeTunnelProcess):
+            def __init__(self) -> None:
+                super().__init__(pid=7171)
+                self.wait_calls = 0
 
-        keychain = FakeKeychain()
-        connect = FakeHealthFactory(
-            {
-                "http://192.168.42.253:8080": [AgentError("direct refused")],
-                "http://127.0.0.1:18080": [None],
-            }
-        )
-        process = UncooperativeProcess()
+            def wait(self, timeout: float | None = None) -> int:
+                self.wait_calls += 1
+                self.waited = True
+                if self.wait_calls == 1:
+                    raise subprocess.TimeoutExpired(("ssh",), timeout)
+                return 0
+
+        process = SlowProcess()
+        group_signals: list[tuple[int, signal.Signals]] = []
         route = ssh_session.ConnectRoute(
-            keychain=keychain,
-            connect_factory=connect,
+            keychain=FakeKeychain(),
+            connect_factory=FakeHealthFactory(
+                {
+                    "http://192.168.42.253:8080": [AgentError("direct refused")],
+                    "http://127.0.0.1:18080": [None],
+                }
+            ),
             popen_executor=FakePopen([process]),
+            group_signaler=lambda pgid, sent: group_signals.append((pgid, sent)),
             control_ready=lambda _bastion, _path: True,
             sleeper=lambda _seconds: None,
         )
@@ -780,8 +840,44 @@ class ConnectRouteTests(unittest.TestCase):
         with route.open(route_config()):
             pass
 
-        self.assertTrue(process.terminated)
-        self.assertTrue(process.killed)
+        self.assertEqual(
+            [(7171, signal.SIGTERM), (7171, signal.SIGKILL)], group_signals
+        )
+        self.assertEqual(2, process.wait_calls)
+
+    def test_cleanup_kills_group_when_term_signal_fails(self) -> None:
+        process = FakeTunnelProcess(pid=7272)
+        sent: list[tuple[int, signal.Signals]] = []
+
+        def kill_group(pgid: int, group_signal: signal.Signals) -> None:
+            sent.append((pgid, group_signal))
+            if group_signal == signal.SIGTERM:
+                raise OSError("term failed")
+
+        ssh_session._stop_tunnel(
+            process, process.pid, group_signaler=kill_group
+        )
+
+        self.assertEqual(
+            [(7272, signal.SIGTERM), (7272, signal.SIGKILL)], sent
+        )
+        self.assertTrue(process.waited)
+
+    def test_cleanup_kills_group_even_when_leader_exits_after_term(self) -> None:
+        process = FakeTunnelProcess(pid=7373)
+        sent: list[tuple[int, signal.Signals]] = []
+
+        ssh_session._stop_tunnel(
+            process,
+            process.pid,
+            group_signaler=lambda pgid, group_signal: sent.append(
+                (pgid, group_signal)
+            ),
+        )
+
+        self.assertEqual(
+            [(7373, signal.SIGTERM), (7373, signal.SIGKILL)], sent
+        )
         self.assertTrue(process.waited)
 
 
@@ -815,6 +911,7 @@ class ManagedTargetSshTests(unittest.TestCase):
         self.assertIn("IdentityAgent=/private/tmp/target-agent.sock", argv)
         self.assertIn("IdentityFile=none", argv)
         self.assertIn("StrictHostKeyChecking=yes", argv)
+        assert_publickey_only(self, argv, batch_mode="yes")
         self.assertEqual(target().known_host + "\n", observed["known_hosts"])
         self.assertTrue(agent.exited)
 
@@ -837,6 +934,7 @@ class ManagedTargetSshTests(unittest.TestCase):
             bastion_keychain_service="bastion-service",
             keychain_account="test-mac",
             popen_executor=popen,
+            group_signaler=ignore_group_signal,
             control_ready=lambda _bastion, _path: True,
             allocate_port=lambda: 49152,
             forward_ready=lambda _host, _port: True,
@@ -854,12 +952,13 @@ class ManagedTargetSshTests(unittest.TestCase):
         self.assertNotIn("/private/tmp/target-agent.sock", tunnel_argv)
         self.assertIn("IdentityAgent=/private/tmp/target-agent.sock", outer_argv)
         self.assertIn("HostKeyAlias=monitor01", outer_argv)
+        assert_publickey_only(self, outer_argv, batch_mode="yes")
+        assert_publickey_only(self, tunnel_argv, batch_mode="no")
         self.assertEqual("49152", outer_argv[outer_argv.index("-p") + 1])
         self.assertEqual(
             ("ubuntu@127.0.0.1", "systemctl", "is-active", "node-exporter"),
             outer_argv[-4:],
         )
-        self.assertTrue(process.terminated)
         self.assertTrue(process.waited)
         self.assertTrue(agent.exited)
 
@@ -878,13 +977,13 @@ class ManagedTargetSshTests(unittest.TestCase):
                 bastion_keychain_service="bastion-service",
                 keychain_account="test-mac",
                 popen_executor=popen,
+                group_signaler=ignore_group_signal,
                 control_ready=lambda _bastion, _path: True,
                 allocate_port=lambda: 49153,
                 forward_ready=lambda _host, _port: True,
                 sleeper=lambda _seconds: None,
             )
 
-        self.assertTrue(process.terminated)
         self.assertTrue(process.waited)
         self.assertTrue(agent.exited)
 
@@ -904,6 +1003,7 @@ class ManagedTargetSshTests(unittest.TestCase):
                 bastion_keychain_service="bastion-service",
                 keychain_account="test-mac",
                 popen_executor=popen,
+                group_signaler=ignore_group_signal,
                 control_ready=lambda _bastion, _path: True,
                 allocate_port=lambda: 49154,
                 forward_ready=lambda _host, _port: False,
