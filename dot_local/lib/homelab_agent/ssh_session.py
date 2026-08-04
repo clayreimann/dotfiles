@@ -48,6 +48,7 @@ _PINNED_SECURITY_OPTIONS = frozenset(
 )
 SshExecutor = Callable[..., subprocess.CompletedProcess[str]]
 PopenExecutor = Callable[..., object]
+ControlReady = Callable[[Bastion, Path], bool]
 _TUNNEL_ATTEMPTS = 20
 _TUNNEL_RETRY_SECONDS = 0.1
 _TUNNEL_WAIT_SECONDS = 5.0
@@ -403,10 +404,11 @@ def _open_bastion_tunnel(
     forward: str,
     *,
     popen_executor: PopenExecutor = subprocess.Popen,
-) -> Iterator[TunnelProcess]:
+) -> Iterator[tuple[TunnelProcess, Path]]:
     """Start one encrypted-key, pinned-host bastion forward and always reap it."""
     with _known_hosts_file(bastion.known_host) as known_hosts_path:
         with _askpass_program() as askpass_path:
+            control_path = askpass_path.parent / "control"
             process: TunnelProcess | None = None
             try:
                 argv = (
@@ -414,6 +416,9 @@ def _open_bastion_tunnel(
                     "-F",
                     "/dev/null",
                     "-NT",
+                    "-M",
+                    "-S",
+                    str(control_path),
                     "-o",
                     "ExitOnForwardFailure=yes",
                     "-o",
@@ -450,7 +455,7 @@ def _open_bastion_tunnel(
                 except Exception:
                     raise AgentError("bastion tunnel could not be started") from None
                 process = started  # type: ignore[assignment]
-                yield process
+                yield process, control_path
             finally:
                 prior_error = sys.exc_info()[0] is not None
                 if process is not None:
@@ -463,6 +468,7 @@ def _open_bastion_tunnel(
 
 def _wait_for_tunnel(
     process: TunnelProcess,
+    ownership_ready: Callable[[], bool],
     ready: Callable[[], bool],
     *,
     sleeper: Callable[[float], None] = time.sleep,
@@ -470,10 +476,41 @@ def _wait_for_tunnel(
     for _attempt in range(_TUNNEL_ATTEMPTS):
         if process.poll() is not None:
             raise AgentError("bastion tunnel exited before becoming healthy")
+        if not ownership_ready():
+            sleeper(_TUNNEL_RETRY_SECONDS)
+            continue
         if ready():
             return
         sleeper(_TUNNEL_RETRY_SECONDS)
     raise AgentError("bastion tunnel did not become healthy")
+
+
+def _control_master_ready(bastion: Bastion, control_path: Path) -> bool:
+    environment = os.environ.copy()
+    for name in _AGENT_ENVIRONMENT_NAMES:
+        environment.pop(name, None)
+    try:
+        completed = subprocess.run(
+            (
+                "/usr/bin/ssh",
+                "-F",
+                "/dev/null",
+                "-S",
+                str(control_path),
+                "-O",
+                "check",
+                "-p",
+                str(bastion.port),
+                f"{bastion.user}@{bastion.host}",
+            ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+        )
+    except Exception:
+        return False
+    return completed.returncode == 0
 
 
 def _url_endpoint(url: str, operation: str) -> tuple[str, int]:
@@ -501,6 +538,7 @@ class ConnectRoute:
         account: str | None = None,
         connect_factory: Callable[..., ConnectClient] = ConnectClient,
         popen_executor: PopenExecutor = subprocess.Popen,
+        control_ready: ControlReady = _control_master_ready,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self._keychain = keychain or Keychain()
@@ -508,6 +546,7 @@ class ConnectRoute:
         self._account = account
         self._connect_factory = connect_factory
         self._popen_executor = popen_executor
+        self._control_ready = control_ready
         self._sleeper = sleeper
 
     @contextmanager
@@ -546,7 +585,7 @@ class ConnectRoute:
             account,
             forward,
             popen_executor=self._popen_executor,
-        ) as process:
+        ) as (process, control_path):
             tunneled = self._connect_factory(
                 config.tunnel_connect_url, token, vault_name=config.vault_name
             )
@@ -558,7 +597,12 @@ class ConnectRoute:
                     return False
                 return True
 
-            _wait_for_tunnel(process, healthy, sleeper=self._sleeper)
+            _wait_for_tunnel(
+                process,
+                lambda: self._control_ready(config.bastion, control_path),
+                healthy,
+                sleeper=self._sleeper,
+            )
             yield config.tunnel_connect_url
 
 
@@ -638,6 +682,7 @@ def run_target_ssh(
     bastion_keychain_service: str | None = None,
     keychain_account: str | None = None,
     popen_executor: PopenExecutor = subprocess.Popen,
+    control_ready: ControlReady = _control_master_ready,
     allocate_port: Callable[[], int] = _allocate_loopback_port,
     forward_ready: Callable[[str, int], bool] = _loopback_ready,
     sleeper: Callable[[float], None] = time.sleep,
@@ -676,9 +721,10 @@ def run_target_ssh(
         keychain_account,
         forward,
         popen_executor=popen_executor,
-    ) as process:
+    ) as (process, control_path):
         _wait_for_tunnel(
             process,
+            lambda: control_ready(bastion, control_path),
             lambda: forward_ready("127.0.0.1", local_port),
             sleeper=sleeper,
         )

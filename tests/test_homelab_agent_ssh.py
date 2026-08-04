@@ -164,6 +164,7 @@ class FakeHealthFactory:
     def __init__(self, outcomes: dict[str, list[object]]) -> None:
         self.outcomes = {url: deque(values) for url, values in outcomes.items()}
         self.calls: list[tuple[str, Secret, str]] = []
+        self.health_calls: list[str] = []
 
     def __call__(self, url: str, token: Secret, *, vault_name: str) -> object:
         self.calls.append((url, token, vault_name))
@@ -171,10 +172,12 @@ class FakeHealthFactory:
 
         class Client:
             def health(self) -> None:
+                self_factory.health_calls.append(url)
                 outcome = outcomes.popleft()
                 if isinstance(outcome, BaseException):
                     raise outcome
 
+        self_factory = self
         return Client()
 
 
@@ -535,6 +538,7 @@ class ConnectRouteTests(unittest.TestCase):
             keychain=keychain,
             connect_factory=connect,
             popen_executor=popen,
+            control_ready=lambda _bastion, _path: True,
             sleeper=lambda _seconds: None,
         )
 
@@ -564,6 +568,7 @@ class ConnectRouteTests(unittest.TestCase):
             keychain=keychain,
             connect_factory=connect,
             popen_executor=popen,
+            control_ready=lambda _bastion, _path: True,
             sleeper=lambda _seconds: None,
         )
 
@@ -575,6 +580,10 @@ class ConnectRouteTests(unittest.TestCase):
             assert isinstance(argv, tuple)
             assert isinstance(env, dict)
             self.assertEqual("/usr/bin/ssh", argv[0])
+            self.assertIn("-M", argv)
+            self.assertIn("-S", argv)
+            control_path = Path(argv[argv.index("-S") + 1])
+            self.assertEqual(Path(env["SSH_ASKPASS"]).parent, control_path.parent)
             self.assertIn("ExitOnForwardFailure=yes", argv)
             self.assertIn("IdentitiesOnly=yes", argv)
             self.assertIn("IdentityAgent=none", argv)
@@ -610,6 +619,7 @@ class ConnectRouteTests(unittest.TestCase):
             keychain=keychain,
             connect_factory=connect,
             popen_executor=popen,
+            control_ready=lambda _bastion, _path: True,
             sleeper=lambda _seconds: None,
         )
 
@@ -638,6 +648,7 @@ class ConnectRouteTests(unittest.TestCase):
             keychain=keychain,
             connect_factory=connect,
             popen_executor=popen,
+            control_ready=lambda _bastion, _path: True,
             sleeper=lambda _seconds: None,
         )
 
@@ -651,6 +662,33 @@ class ConnectRouteTests(unittest.TestCase):
             next(value.removeprefix("UserKnownHostsFile=") for value in argv if value.startswith("UserKnownHostsFile="))
         )
         self.assertFalse(known_hosts.exists())
+        self.assertTrue(process.waited)
+
+    def test_authenticated_health_waits_for_this_ssh_master_to_own_the_forward(self) -> None:
+        keychain = FakeKeychain()
+        connect = FakeHealthFactory(
+            {
+                "http://192.168.42.253:8080": [AgentError("direct refused")],
+                "http://127.0.0.1:18080": [None],
+            }
+        )
+        process = FakeTunnelProcess()
+        route = ssh_session.ConnectRoute(
+            keychain=keychain,
+            connect_factory=connect,
+            popen_executor=FakePopen([process]),
+            control_ready=lambda _bastion, _path: False,
+            sleeper=lambda _seconds: None,
+        )
+
+        with self.assertRaisesRegex(AgentError, "bastion tunnel did not become healthy"):
+            with route.open(route_config()):
+                self.fail("unowned loopback listener must not receive a Connect token")
+
+        self.assertEqual(
+            ["http://192.168.42.253:8080"], connect.health_calls
+        )
+        self.assertTrue(process.terminated)
         self.assertTrue(process.waited)
 
     def test_askpass_reads_the_exact_keychain_item_without_secret_argv_or_environment(self) -> None:
@@ -722,6 +760,7 @@ class ConnectRouteTests(unittest.TestCase):
             keychain=keychain,
             connect_factory=connect,
             popen_executor=FakePopen([process]),
+            control_ready=lambda _bastion, _path: True,
             sleeper=lambda _seconds: None,
         )
 
@@ -785,6 +824,7 @@ class ManagedTargetSshTests(unittest.TestCase):
             bastion_keychain_service="bastion-service",
             keychain_account="test-mac",
             popen_executor=popen,
+            control_ready=lambda _bastion, _path: True,
             allocate_port=lambda: 49152,
             forward_ready=lambda _host, _port: True,
             sleeper=lambda _seconds: None,
@@ -825,6 +865,7 @@ class ManagedTargetSshTests(unittest.TestCase):
                 bastion_keychain_service="bastion-service",
                 keychain_account="test-mac",
                 popen_executor=popen,
+                control_ready=lambda _bastion, _path: True,
                 allocate_port=lambda: 49153,
                 forward_ready=lambda _host, _port: True,
                 sleeper=lambda _seconds: None,
@@ -850,6 +891,7 @@ class ManagedTargetSshTests(unittest.TestCase):
                 bastion_keychain_service="bastion-service",
                 keychain_account="test-mac",
                 popen_executor=popen,
+                control_ready=lambda _bastion, _path: True,
                 allocate_port=lambda: 49154,
                 forward_ready=lambda _host, _port: False,
                 sleeper=lambda _seconds: None,
