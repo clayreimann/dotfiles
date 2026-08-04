@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dot_local" / "lib"
 from homelab_agent.op_command import UsageError, run_op, validate_op_argv
 from homelab_agent.process import AgentError, Runner, Secret
 from homelab_agent.models import Repository
+from homelab_agent.doctor import CheckResult, enroll_keychain, run_doctor
 
 
 TOKEN = "token-value"
@@ -660,6 +661,217 @@ class GitCommandTests(unittest.TestCase):
             self.assertEqual(1, rc)
             self.assertIn("homelab-agent:", stderr.getvalue())
             self.assertEqual([], self.runner.calls)
+
+
+class DoctorAndEnrollmentTests(unittest.TestCase):
+    """TDD coverage for the public diagnostic and interactive enrollment boundary."""
+
+    def setUp(self) -> None:
+        self.keychain = FakeKeychain()
+        self.config = SimpleNamespace(
+            tools={
+                "python": "3.12",
+                "git": "2",
+                "op": "2",
+                "tofu": "1",
+                "ansible": "2",
+                "tailscale": "1",
+            },
+            vault_name="Homelab Secrets",
+            connect_keychain_service="connect-service",
+            bastion_keychain_service="bastion-service",
+            direct_connect_url="http://connect.example:8080",
+            tunnel_connect_url="http://127.0.0.1:18080",
+            forgejo=SimpleNamespace(
+                host="git.example",
+                port=2222,
+                user="git",
+                credential_item_id="item-id",
+                private_field="private_key",
+                expected_fingerprint="SHA256:expected",
+                known_host="[git.example]:2222 ssh-ed25519 AAAAPinned",
+            ),
+            bastion=None,
+            targets={},
+            repositories=(),
+        )
+
+    def test_non_live_doctor_reports_missing_or_wrong_tools_without_keychain(self) -> None:
+        results = run_doctor(
+            live=False,
+            load=lambda: self.config,
+            executable_exists=lambda path: path.name != "op",
+            python_version=lambda: "3.11.9",
+            keychain_factory=lambda: self.fail("non-live doctor must not use Keychain"),
+        )
+
+        self.assertIn(
+            CheckResult("FAIL", "tools", "python", "required Python 3.12 is unavailable"),
+            results,
+        )
+        self.assertIn(
+            CheckResult("FAIL", "tools", "op", "required executable is unavailable"),
+            results,
+        )
+
+    def test_live_doctor_redacts_missing_keychain_and_connect_route_failures(self) -> None:
+        class MissingKeychain(FakeKeychain):
+            def read(self, service: str, account: str) -> Secret:
+                raise AgentError("secret-token-must-not-appear")
+
+        results = run_doctor(
+            live=True,
+            load=lambda: self.config,
+            executable_exists=lambda _path: True,
+            python_version=lambda: "3.12.7",
+            keychain_factory=MissingKeychain,
+        )
+
+        failed = {(result.category, result.name): result.detail for result in results if result.status == "FAIL"}
+        self.assertIn(("keychain", "Connect token"), failed)
+        self.assertNotIn("secret-token-must-not-appear", " ".join(failed.values()))
+
+    def test_live_doctor_reports_failed_direct_and_tunnel_routing_without_raw_errors(self) -> None:
+        class FailingRoute:
+            @contextmanager
+            def open(self, _config: object):
+                raise AgentError("direct-and-tunnel-secret-fixture")
+                yield ""  # pragma: no cover - keeps this a context-manager generator
+
+        results = run_doctor(
+            live=True,
+            load=lambda: self.config,
+            executable_exists=lambda _path: True,
+            python_version=lambda: "3.12.7",
+            keychain_factory=lambda: self.keychain,
+            route_factory=lambda **_kwargs: FailingRoute(),
+        )
+
+        route = next(result for result in results if result.name == "Connect route")
+        self.assertEqual(CheckResult("FAIL", "network", "Connect route", "live routing is unavailable"), route)
+        self.assertNotIn("direct-and-tunnel-secret-fixture", " ".join(result.detail for result in results))
+
+    def test_live_doctor_categorizes_credential_fingerprint_host_and_authorization_failures(self) -> None:
+        class Route:
+            @contextmanager
+            def open(self, _config: object):
+                yield "http://connect.example:8080"
+
+        class Client:
+            def health(self) -> None:
+                return None
+
+            def get_string_field(self, _item: str, _field: str) -> Secret:
+                return Secret("private-key-fixture")
+
+        results = run_doctor(
+            live=True,
+            load=lambda: self.config,
+            executable_exists=lambda _path: True,
+            python_version=lambda: "3.12.7",
+            keychain_factory=lambda: self.keychain,
+            route_factory=lambda **_kwargs: Route(),
+            connect_factory=lambda *_args, **_kwargs: Client(),
+            credential_validator=lambda *_args, **_kwargs: False,
+            host_trust_checker=lambda _identity: False,
+            forgejo_probe=lambda *_args, **_kwargs: 255,
+        )
+
+        observed = {(result.category, result.name): result.status for result in results}
+        self.assertEqual("FAIL", observed[("credential", "forgejo credential")])
+        self.assertEqual("FAIL", observed[("host-trust", "Forgejo host key")])
+        self.assertEqual("FAIL", observed[("server-authorization", "Forgejo authentication")])
+        self.assertNotIn("private-key-fixture", " ".join(result.detail for result in results))
+
+    def test_live_doctor_reports_clean_configured_clone_wiring_without_mutating_or_fetching(self) -> None:
+        repository = Repository(
+            "infra", "ssh://git@git.example:2222/homelab/infra.git", Path("/work/infra")
+        )
+        self.config.repositories = (repository,)
+
+        class Route:
+            @contextmanager
+            def open(self, _config: object):
+                yield "http://connect.example:8080"
+
+        class Client:
+            def health(self) -> None:
+                return None
+
+            def get_string_field(self, _item: str, _field: str) -> Secret:
+                return Secret("private-key-fixture")
+
+        inspected: list[Repository] = []
+        results = run_doctor(
+            live=True,
+            load=lambda: self.config,
+            executable_exists=lambda _path: True,
+            python_version=lambda: "3.12.7",
+            keychain_factory=lambda: self.keychain,
+            route_factory=lambda **_kwargs: Route(),
+            connect_factory=lambda *_args, **_kwargs: Client(),
+            credential_validator=lambda *_args, **_kwargs: True,
+            host_trust_checker=lambda _identity: True,
+            forgejo_probe=lambda *_args, **_kwargs: 1,
+            repository_inspector=lambda configured: inspected.append(configured) or True,
+        )
+
+        self.assertEqual([repository], inspected)
+        self.assertIn(CheckResult("PASS", "git-wiring", "infra", "repository wiring is approved"), results)
+
+    def test_doctor_cli_grammar_and_output_are_strict_and_secret_free(self) -> None:
+        from homelab_agent import cli
+
+        output = io.StringIO()
+        rc = cli.main(
+            ["doctor", "--live", "unexpected"],
+            output=output,
+            error_output=io.StringIO(),
+        )
+        self.assertEqual(2, rc)
+
+        output = io.StringIO()
+        rc = cli.main(
+            ["doctor"],
+            doctor_runner=lambda _live: (
+                CheckResult("FAIL", "config", "credential map", "contains secret-token-fixture"),
+            ),
+            output=output,
+            error_output=io.StringIO(),
+        )
+        self.assertEqual(1, rc)
+        self.assertNotIn("secret-token-fixture", output.getvalue())
+        self.assertIn("FAIL config credential map:", output.getvalue())
+
+    def test_enrollment_is_pinned_and_bastion_rejects_unencrypted_keys(self) -> None:
+        recorded: list[tuple[str, str]] = []
+        enroll_keychain(
+            "connect-service",
+            load=lambda: self.config,
+            keychain_factory=lambda: SimpleNamespace(
+                local_account=lambda: "test-mac",
+                enroll=lambda service, account: recorded.append((service, account)),
+            ),
+        )
+        self.assertEqual([("connect-service", "test-mac")], recorded)
+
+        with self.assertRaisesRegex(AgentError, "not approved"):
+            enroll_keychain(
+                "unapproved-service",
+                load=lambda: self.config,
+                keychain_factory=lambda: self.keychain,
+            )
+
+        with self.assertRaisesRegex(AgentError, "unencrypted"):
+            enroll_keychain(
+                "bastion-service",
+                load=lambda: self.config,
+                keychain_factory=lambda: self.keychain,
+                key_path=Path("/Users/clay/.ssh/homelab_bastion_bootstrap"),
+                path_stat=lambda _path: SimpleNamespace(st_mode=0o100600),
+                chmod=lambda _path, _mode: None,
+                empty_passphrase_probe=lambda _path: 0,
+            )
 
 
 if __name__ == "__main__":

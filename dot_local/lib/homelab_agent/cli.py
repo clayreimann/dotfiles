@@ -8,6 +8,7 @@ from typing import Any, Mapping, TextIO
 
 from .config import ConfigError, load_config
 from .connect import ConnectClient
+from .doctor import CheckResult, enroll_keychain, run_doctor
 from .git_command import run_git
 from .keychain import Keychain
 from .op_command import run_op
@@ -30,6 +31,10 @@ def _valid_invocation(arguments: Sequence[str]) -> bool:
         ) or (
             len(arguments) == 3 and arguments[1] in {"clone", "configure", "fetch"}
         )
+    if arguments in (["doctor"], ["doctor", "--live"]):
+        return True
+    if arguments in (["enroll", "connect-token"], ["enroll", "bastion-passphrase"]):
+        return True
     return False
 
 
@@ -40,6 +45,10 @@ def _usage(arguments: Sequence[str]) -> str:
         return "usage: homelab-agent op <approved 1Password command>"
     if arguments and arguments[0] == "git":
         return "usage: homelab-agent git clone NAME|clone-foundation|configure PATH|fetch NAME"
+    if arguments and arguments[0] == "doctor":
+        return "usage: homelab-agent doctor [--live]"
+    if arguments and arguments[0] == "enroll":
+        return "usage: homelab-agent enroll connect-token|bastion-passphrase"
     return "usage: homelab-agent forgejo-ssh -- <git-supplied ssh args>"
 
 
@@ -135,14 +144,48 @@ def main(
     route_factory: Callable[..., ConnectRoute] = ConnectRoute,
     op_runner: Callable[[Sequence[str]], int] = run_op,
     git_runner: Callable[[Sequence[str]], int] = run_git,
+    doctor_runner: Callable[[bool], Sequence[CheckResult]] | None = None,
+    enroll_runner: Callable[[str], None] | None = None,
+    output: TextIO | None = None,
+    error_output: TextIO | None = None,
 ) -> int:
     """Dispatch the approved wrappers without exposing credential values."""
+    actual_output = output or sys.stdout
+    actual_error_output = error_output or sys.stderr
     arguments = list(sys.argv[1:] if argv is None else argv)
     if not _valid_invocation(arguments):
-        print(_usage(arguments), file=sys.stderr)
+        print(_usage(arguments), file=actual_error_output)
         return 2
 
     try:
+        if arguments[0] == "doctor":
+            live = arguments == ["doctor", "--live"]
+            checks = (
+                doctor_runner(live)
+                if doctor_runner is not None
+                else run_doctor(
+                    live,
+                    load=load,
+                    keychain_factory=keychain_factory,
+                    connect_factory=connect_factory,
+                    route_factory=route_factory,
+                )
+            )
+            for check in checks:
+                print(_format_check(check), file=actual_output)
+            return 0 if all(check.status == "PASS" for check in checks) else 1
+        if arguments[0] == "enroll":
+            config = load()
+            service = (
+                config.connect_keychain_service
+                if arguments[1] == "connect-token"
+                else config.bastion_keychain_service
+            )
+            if enroll_runner is not None:
+                enroll_runner(service)
+            else:
+                enroll_keychain(service, load=load, keychain_factory=keychain_factory)
+            return 0
         if arguments[0] == "op":
             return op_runner(arguments[1:])
         if arguments[0] == "git":
@@ -157,8 +200,40 @@ def main(
             route_factory=route_factory,
         )
     except (AgentError, ConfigError) as error:
-        print(f"homelab-agent: {error}", file=sys.stderr)
+        print(f"homelab-agent: {error}", file=actual_error_output)
         return 1
+
+
+def _format_check(check: CheckResult) -> str:
+    """Render only established public text; never relay error strings from dependencies."""
+    safe_details = {
+        "required executable is unavailable",
+        "required Python 3.12 is unavailable",
+        "approved executable is available",
+        "public configuration is approved",
+        "public configuration is invalid",
+        "local account is unavailable",
+        "local account is available",
+        "required item is unavailable",
+        "required item is available",
+        "live routing is unavailable",
+        "Connect inspection is unavailable",
+        "credential validation is unavailable",
+        "host trust validation is unavailable",
+        "server authorization is unavailable",
+        "approved route is healthy",
+        "approved vault is reachable",
+        "exact field and fingerprint are approved",
+        "exact field or fingerprint is invalid",
+        "pinned host key is approved",
+        "pinned host key is invalid",
+        "pinned authentication succeeded",
+        "pinned authentication was rejected",
+        "repository wiring is approved",
+        "repository wiring is invalid",
+    }
+    detail = check.detail if check.detail in safe_details else "redacted diagnostic"
+    return f"{check.status} {check.category} {check.name}: {detail}"
 
 
 if __name__ == "__main__":

@@ -1,0 +1,2 @@
+#!/bin/zsh
+exec /usr/bin/env PYTHONPATH=/Users/clay/.local/lib /opt/homebrew/bin/python3.12 -m homelab_agent.cli "$@"
