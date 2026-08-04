@@ -400,6 +400,96 @@ class OpCommandTests(unittest.TestCase):
         self.assertEqual([("item", "list")], observed)
 
 
+class CommandHelpTests(unittest.TestCase):
+    """The installed wrappers expose help without loading config or secrets."""
+
+    def test_every_public_wrapper_has_stable_help_before_config_or_keychain(self) -> None:
+        from homelab_agent import cli
+
+        expected = {
+            ("--help",): (
+                "usage: homelab-agent <command>\n\n"
+                "Commands:\n"
+                "  doctor [--live]\n"
+                "  enroll connect-token|bastion-passphrase\n"
+                "  git clone NAME|clone-foundation|configure PATH|fetch NAME\n"
+                "  ssh TARGET -- COMMAND...\n"
+                "  op <approved 1Password command>\n"
+            ),
+            ("git", "--help"): (
+                "usage: homelab-agent-git clone NAME|clone-foundation|configure PATH|fetch NAME\n\n"
+                "Approved commands:\n"
+                "  clone NAME\n"
+                "  clone-foundation\n"
+                "  configure PATH\n"
+                "  fetch NAME\n"
+            ),
+            ("ssh", "--help"): (
+                "usage: homelab-agent-ssh TARGET -- COMMAND...\n\n"
+                "TARGET is one configured host alias. COMMAND is passed as an argument list to\n"
+                "that host; the helper does not accept host, user, port, or identity overrides.\n"
+            ),
+            ("op", "--help"): (
+                "usage: homelab-agent-op COMMAND\n\n"
+                "Approved commands (Homelab Secrets only):\n"
+                "  vault list\n"
+                "  vault get Homelab Secrets\n"
+                "  item list\n"
+                "  item get ITEM_UUID\n"
+                "  item create -                 # JSON object on stdin\n"
+                "  item edit ITEM_UUID            # JSON object on stdin\n"
+                "  read op://Homelab Secrets/ITEM/FIELD\n\n"
+                "Item deletion is intentionally unsupported. Create and edit accept no flags or\n"
+                "assignments; provide the complete JSON object on standard input.\n"
+            ),
+        }
+        for argv, help_text in expected.items():
+            with self.subTest(argv=argv):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                rc = cli.main(
+                    argv,
+                    load=lambda: self.fail("help must not load configuration"),
+                    keychain_factory=lambda: self.fail("help must not access Keychain"),
+                    output=stdout,
+                    error_output=stderr,
+                )
+
+                self.assertEqual(0, rc)
+                self.assertEqual(help_text, stdout.getvalue())
+                self.assertEqual("", stderr.getvalue())
+
+    def test_op_help_lists_only_the_supported_vault_pinned_grammar(self) -> None:
+        from homelab_agent import cli
+
+        stdout = io.StringIO()
+        rc = cli.main(
+            ["op", "--help"],
+            load=lambda: self.fail("help must not load configuration"),
+            keychain_factory=lambda: self.fail("help must not access Keychain"),
+            output=stdout,
+            error_output=io.StringIO(),
+        )
+
+        self.assertEqual(0, rc)
+        self.assertEqual(
+            "usage: homelab-agent-op COMMAND\n"
+            "\n"
+            "Approved commands (Homelab Secrets only):\n"
+            "  vault list\n"
+            "  vault get Homelab Secrets\n"
+            "  item list\n"
+            "  item get ITEM_UUID\n"
+            "  item create -                 # JSON object on stdin\n"
+            "  item edit ITEM_UUID            # JSON object on stdin\n"
+            "  read op://Homelab Secrets/ITEM/FIELD\n"
+            "\n"
+            "Item deletion is intentionally unsupported. Create and edit accept no flags or\n"
+            "assignments; provide the complete JSON object on standard input.\n",
+            stdout.getvalue(),
+        )
+
+
 class GitCommandTests(unittest.TestCase):
     def setUp(self) -> None:
         from homelab_agent.git_command import SSH_COMMAND

@@ -16,6 +16,57 @@ from .process import AgentError
 from .ssh_session import ConnectRoute, EphemeralAgent, run_pinned_ssh, run_target_ssh
 
 
+_MAIN_HELP = """usage: homelab-agent <command>
+
+Commands:
+  doctor [--live]
+  enroll connect-token|bastion-passphrase
+  git clone NAME|clone-foundation|configure PATH|fetch NAME
+  ssh TARGET -- COMMAND...
+  op <approved 1Password command>
+"""
+_GIT_HELP = """usage: homelab-agent-git clone NAME|clone-foundation|configure PATH|fetch NAME
+
+Approved commands:
+  clone NAME
+  clone-foundation
+  configure PATH
+  fetch NAME
+"""
+_SSH_HELP = """usage: homelab-agent-ssh TARGET -- COMMAND...
+
+TARGET is one configured host alias. COMMAND is passed as an argument list to
+that host; the helper does not accept host, user, port, or identity overrides.
+"""
+_OP_HELP = """usage: homelab-agent-op COMMAND
+
+Approved commands (Homelab Secrets only):
+  vault list
+  vault get Homelab Secrets
+  item list
+  item get ITEM_UUID
+  item create -                 # JSON object on stdin
+  item edit ITEM_UUID            # JSON object on stdin
+  read op://Homelab Secrets/ITEM/FIELD
+
+Item deletion is intentionally unsupported. Create and edit accept no flags or
+assignments; provide the complete JSON object on standard input.
+"""
+
+
+def _help(arguments: Sequence[str]) -> str | None:
+    """Return public help before configuration, Keychain, or transport work."""
+    if arguments == ["--help"]:
+        return _MAIN_HELP
+    if arguments == ["git", "--help"]:
+        return _GIT_HELP
+    if arguments == ["ssh", "--help"]:
+        return _SSH_HELP
+    if arguments == ["op", "--help"]:
+        return _OP_HELP
+    return None
+
+
 def _valid_invocation(arguments: Sequence[str]) -> bool:
     if arguments == ["askpass"]:
         return True
@@ -153,6 +204,11 @@ def main(
     actual_output = output or sys.stdout
     actual_error_output = error_output or sys.stderr
     arguments = list(sys.argv[1:] if argv is None else argv)
+    help_text = _help(arguments)
+    if help_text is not None:
+        actual_output.write(help_text)
+        actual_output.flush()
+        return 0
     if not _valid_invocation(arguments):
         print(_usage(arguments), file=actual_error_output)
         return 2
