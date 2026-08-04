@@ -20,6 +20,7 @@ from .ssh_session import ConnectRoute
 
 TEA = "/opt/homebrew/bin/tea"
 _LOGIN_NAME = "homelab-agent"
+_EXPECTED_API_LOGIN = "claude"
 _MINIMUM_VERSION = (0, 14, 2)
 _VERSION_PATTERN = re.compile(r"(?:Version:\s*|\bversion\s+)(\d+)\.(\d+)\.(\d+)", re.I)
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -79,7 +80,7 @@ class TeaSession:
                 payload = json.loads(identity.stdout)
             except json.JSONDecodeError:
                 raise AgentError("Tea identity verification failed") from None
-            if not isinstance(payload, dict) or payload.get("login") != self._forgejo.api_user:
+            if not isinstance(payload, dict) or payload.get("login") != _EXPECTED_API_LOGIN:
                 raise AgentError("Tea identity verification failed")
         except BaseException:
             self._cleanup()
@@ -97,11 +98,8 @@ class TeaSession:
         error_output: TextIO,
     ) -> int:
         """Run arbitrary Tea arguments with the temporary login only."""
-        completed = self._execute((TEA, *arguments), self._child_environment())
-        output.write(completed.stdout)
-        output.flush()
-        error_output.write(completed.stderr)
-        error_output.flush()
+        del output, error_output
+        completed = self._execute_interactive((TEA, *arguments), self._child_environment())
         return completed.returncode
 
     def api_json(self, arguments: Sequence[str]) -> object:
@@ -149,6 +147,14 @@ class TeaSession:
     ) -> subprocess.CompletedProcess[str]:
         try:
             return self._executor(argv, text=True, capture_output=True, env=dict(environment))
+        except Exception:
+            raise AgentError("Tea process could not be started") from None
+
+    def _execute_interactive(
+        self, argv: tuple[str, ...], environment: Mapping[str, str]
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            return self._executor(argv, env=dict(environment))
         except Exception:
             raise AgentError("Tea process could not be started") from None
 

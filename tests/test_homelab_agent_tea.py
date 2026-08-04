@@ -57,11 +57,11 @@ def completed(
     return subprocess.CompletedProcess((TEA,), returncode, stdout=stdout, stderr=stderr)
 
 
-def config() -> SimpleNamespace:
+def config(api_user: str = "claude") -> SimpleNamespace:
     return SimpleNamespace(
         forgejo=SimpleNamespace(
             api_url="https://git.4406.madtown.cloud",
-            api_user="claude",
+            api_user=api_user,
             credential_item_id="yznfzgoql7jl4oa6spa7vm3644",
             api_token_field="api_token",
         )
@@ -114,8 +114,8 @@ class TeaSessionTests(unittest.TestCase):
         )
 
         self.assertEqual(0, result)
-        self.assertEqual("issue list\n", output.getvalue())
-        self.assertEqual("Tea warning\n", error_output.getvalue())
+        self.assertEqual("", output.getvalue())
+        self.assertEqual("", error_output.getvalue())
         self.assertEqual(
             [("yznfzgoql7jl4oa6spa7vm3644", "api_token")], client.calls
         )
@@ -222,20 +222,48 @@ class TeaSessionTests(unittest.TestCase):
 
         self.assertEqual(3, len(executor.calls))
 
-    def test_forwards_the_caller_exit_code_and_both_output_streams(self) -> None:
-        result, _executor, _client, output, error_output = self.run_tea(
+    def test_forwards_caller_exit_code_with_inherited_terminal_streams(self) -> None:
+        result, executor, _client, output, error_output = self.run_tea(
             [
                 completed(stdout="Version: 0.14.2\n"),
                 completed(),
                 completed(stdout='{"login":"claude"}'),
-                completed(23, stdout="caller stdout\n", stderr="caller stderr\n"),
+                completed(23, stdout="buffered stdout must not replay\n", stderr="buffered stderr must not replay\n"),
             ],
             ["issues", "list"],
         )
 
         self.assertEqual(23, result)
-        self.assertEqual("caller stdout\n", output.getvalue())
-        self.assertEqual("caller stderr\n", error_output.getvalue())
+        self.assertNotIn("capture_output", executor.calls[-1])
+        self.assertNotIn("stdin", executor.calls[-1])
+        self.assertNotIn("stdout", executor.calls[-1])
+        self.assertNotIn("stderr", executor.calls[-1])
+        self.assertEqual("", output.getvalue())
+        self.assertEqual("", error_output.getvalue())
+
+    def test_forged_config_identity_cannot_weaken_the_claude_invariant(self) -> None:
+        from homelab_agent.process import AgentError
+        from homelab_agent.tea_session import TeaSession
+
+        executor = RecordingExecutor(
+            [
+                completed(stdout="Version: 0.14.2\n"),
+                completed(),
+                completed(stdout='{"login":"attacker"}'),
+            ]
+        )
+        session = TeaSession(
+            config(api_user="attacker").forgejo,
+            FakeConnectClient(),
+            executor=executor,
+            environ={},
+        )
+
+        with self.assertRaisesRegex(AgentError, "Tea identity verification failed"):
+            with session:
+                pass
+
+        self.assertEqual(3, len(executor.calls))
 
     def test_session_api_json_uses_tea_and_returns_the_decoded_response(self) -> None:
         from homelab_agent.tea_session import TeaSession
