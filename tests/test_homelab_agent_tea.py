@@ -97,10 +97,13 @@ class TeaSessionTests(unittest.TestCase):
     def test_authenticated_command_preserves_arbitrary_arguments_and_secret_boundaries(self) -> None:
         inherited = {
             "KEEP": "value",
+            "GITEA_TOKEN": "attacker-gitea-token",
+            "GITEA_UNRELATED": "attacker-gitea-value",
             "GITEA_SERVER_URL": "https://attacker.example",
             "GITEA_SERVER_USER": "attacker",
             "GITEA_SERVER_TOKEN": "attacker-token",
             "GITEA_SERVER_PASSWORD": "attacker-password",
+            "TEA_TRACE": "1",
             "XDG_CONFIG_HOME": "/tmp/attacker-config",
         }
         arguments = ["api", "/repos/{owner}/{repo}/issues", "--repo", "owner/repo"]
@@ -127,15 +130,21 @@ class TeaSessionTests(unittest.TestCase):
         self.assertEqual((TEA, *arguments), executor.calls[3]["argv"])
         self.assertEqual("https://git.4406.madtown.cloud", executor.calls[1]["env"]["GITEA_SERVER_URL"])
         self.assertEqual(TOKEN, executor.calls[1]["env"]["GITEA_SERVER_TOKEN"])
-        self.assertNotIn("GITEA_SERVER_USER", executor.calls[1]["env"])
+        self.assertEqual(
+            {
+                "GITEA_SERVER_URL": "https://git.4406.madtown.cloud",
+                "GITEA_SERVER_TOKEN": TOKEN,
+            },
+            {
+                name: value
+                for name, value in executor.calls[1]["env"].items()
+                if name.startswith(("GITEA_", "TEA_"))
+            },
+        )
         for call in (executor.calls[0], executor.calls[2], executor.calls[3]):
-            for name in (
-                "GITEA_SERVER_URL",
-                "GITEA_SERVER_USER",
-                "GITEA_SERVER_TOKEN",
-                "GITEA_SERVER_PASSWORD",
-            ):
-                self.assertNotIn(name, call["env"])
+            self.assertFalse(
+                any(name.startswith(("GITEA_", "TEA_")) for name in call["env"])
+            )
         self.assertEqual(inherited, {
             name: value for name, value in inherited.items()
         })

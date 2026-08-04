@@ -128,7 +128,7 @@ class TeaSession:
         environment = {
             name: value
             for name, value in self._environ.items()
-            if not name.startswith("GITEA_SERVER_")
+            if not name.startswith(("GITEA_", "TEA_"))
         }
         environment["XDG_CONFIG_HOME"] = str(self._config_root)
         if overlay is not None:

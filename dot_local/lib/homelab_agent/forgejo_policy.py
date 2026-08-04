@@ -146,7 +146,7 @@ def checks_status(session: ApiSession, automation: Any, repository: str, commit_
     expected_total: int | None = None
     while True:
         endpoint = (
-            f"/repos/{automation.repository}/actions/runs?head_sha={commit_sha}"
+            f"/repos/{automation.repository}/actions/runs?head_sha={expected_sha}"
             f"&event=pull_request&limit={_PAGE_SIZE}&page={page}"
         )
         page_entries, total_count = _parse_workflow_runs(_request(session, (endpoint,)))
@@ -351,7 +351,7 @@ def _cli_run_id(value: str) -> int:
 
 
 def _deploy_cli_options(values: Sequence[str]) -> dict[str, object]:
-    result: dict[str, object] = {"stacks": None, "post_deploy_configure": False}
+    result: dict[str, object] = {"post_deploy_configure": False}
     index = 0
     while index < len(values):
         option = values[index]
@@ -370,6 +370,7 @@ def _deploy_cli_options(values: Sequence[str]) -> dict[str, object]:
         index += 2
     if "target_host" not in result or "reason" not in result or "confirm" not in result:
         raise PolicyError("invalid Forgejo policy invocation")
+    result.setdefault("stacks", None)
     return result
 
 

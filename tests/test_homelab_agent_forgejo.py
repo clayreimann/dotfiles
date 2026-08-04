@@ -91,6 +91,23 @@ class ForgejoPolicyTests(unittest.TestCase):
             session.calls[0][0],
         )
 
+    def test_check_status_normalizes_an_uppercase_commit_id_for_query_and_matching(self) -> None:
+        from homelab_agent.forgejo_policy import checks_status
+
+        uppercase_sha = SHA.upper()
+        session = Session([{"workflow_runs": [
+            run("validate.yml", 11, "success", "2026-08-04T01:00:00Z"),
+            run("plan.yml", 12, "success", "2026-08-04T01:00:00Z"),
+        ]}])
+
+        result = checks_status(session, AUTOMATION, "infra", uppercase_sha)
+
+        self.assertEqual("success", result.state)
+        self.assertEqual(
+            (f"/repos/homelab/infra/actions/runs?head_sha={SHA}&event=pull_request&limit=50&page=1",),
+            session.calls[0][0],
+        )
+
     def test_check_status_aggregates_missing_pending_success_and_terminal_failure(self) -> None:
         from homelab_agent.forgejo_policy import checks_status
 
@@ -309,6 +326,44 @@ class ForgejoPolicyTests(unittest.TestCase):
 
         self.assertEqual(0, result)
         self.assertEqual("apply", session.calls[0][1]["inputs"]["confirm"])
+
+    def test_deploy_cli_accepts_one_stacks_option(self) -> None:
+        from homelab_agent.forgejo_policy import run_forgejo
+
+        session = Session([{"id": 82}])
+        result = run_forgejo(
+            [
+                "deploy", "stacks", "--target-host", "docker01",
+                "--reason", "maintenance", "--stacks", "traefik,authentik",
+                "--confirm", "apply",
+            ],
+            session=session,
+            automation=AUTOMATION,
+            output=io.StringIO(),
+        )
+
+        self.assertEqual(0, result)
+        self.assertEqual(
+            "traefik,authentik", session.calls[0][1]["inputs"]["target_stacks"]
+        )
+
+    def test_deploy_cli_rejects_repeated_stacks_options_before_dispatch(self) -> None:
+        from homelab_agent.forgejo_policy import PolicyError, run_forgejo
+
+        session = Session([])
+        with self.assertRaisesRegex(PolicyError, "invalid Forgejo policy invocation"):
+            run_forgejo(
+                [
+                    "deploy", "stacks", "--target-host", "docker01",
+                    "--reason", "maintenance", "--stacks", "traefik",
+                    "--stacks", "authentik", "--confirm", "apply",
+                ],
+                session=session,
+                automation=AUTOMATION,
+                output=io.StringIO(),
+            )
+
+        self.assertEqual([], session.calls)
 
     def test_public_check_output_contains_no_response_diagnostics(self) -> None:
         from homelab_agent.forgejo_policy import checks_status, format_checks_status
