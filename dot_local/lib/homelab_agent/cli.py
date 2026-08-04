@@ -8,6 +8,7 @@ from typing import Any, Mapping, TextIO
 
 from .config import ConfigError, load_config
 from .connect import ConnectClient
+from .git_command import run_git
 from .keychain import Keychain
 from .op_command import run_op
 from .process import AgentError
@@ -23,6 +24,12 @@ def _valid_invocation(arguments: Sequence[str]) -> bool:
         return len(arguments) >= 4 and arguments[2] == "--"
     if arguments and arguments[0] == "op":
         return len(arguments) >= 2
+    if arguments and arguments[0] == "git":
+        return (
+            len(arguments) == 2 and arguments[1] == "clone-foundation"
+        ) or (
+            len(arguments) == 3 and arguments[1] in {"clone", "configure", "fetch"}
+        )
     return False
 
 
@@ -31,6 +38,8 @@ def _usage(arguments: Sequence[str]) -> str:
         return "usage: homelab-agent ssh TARGET -- COMMAND..."
     if arguments and arguments[0] == "op":
         return "usage: homelab-agent op <approved 1Password command>"
+    if arguments and arguments[0] == "git":
+        return "usage: homelab-agent git clone NAME|clone-foundation|configure PATH|fetch NAME"
     return "usage: homelab-agent forgejo-ssh -- <git-supplied ssh args>"
 
 
@@ -125,6 +134,7 @@ def main(
     target_transport: Callable[..., int] = run_target_ssh,
     route_factory: Callable[..., ConnectRoute] = ConnectRoute,
     op_runner: Callable[[Sequence[str]], int] = run_op,
+    git_runner: Callable[[Sequence[str]], int] = run_git,
 ) -> int:
     """Dispatch the approved wrappers without exposing credential values."""
     arguments = list(sys.argv[1:] if argv is None else argv)
@@ -135,6 +145,8 @@ def main(
     try:
         if arguments[0] == "op":
             return op_runner(arguments[1:])
+        if arguments[0] == "git":
+            return git_runner(arguments[1:])
         return run(
             arguments,
             load=load,

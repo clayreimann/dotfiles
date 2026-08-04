@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dot_local" / "lib"
 
 from homelab_agent.op_command import UsageError, run_op, validate_op_argv
 from homelab_agent.process import AgentError, Runner, Secret
+from homelab_agent.models import Repository
 
 
 TOKEN = "token-value"
@@ -396,6 +397,169 @@ class OpCommandTests(unittest.TestCase):
 
         self.assertEqual(7, rc)
         self.assertEqual([("item", "list")], observed)
+
+
+class GitCommandTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from homelab_agent.git_command import SSH_COMMAND
+
+        self.runner = FakeRunner()
+        self.ssh_command = SSH_COMMAND
+        self.repositories = (
+            Repository(
+                "infra",
+                "ssh://git@git.4406.madtown.cloud:2222/homelab/infra.git",
+                Path("/Users/clay/Code/homelab/infra"),
+            ),
+            Repository(
+                "platform-deploy",
+                "ssh://git@git.4406.madtown.cloud:2222/homelab/platform-deploy.git",
+                Path("/Users/clay/Code/homelab/platform-deploy"),
+            ),
+            Repository(
+                "observability",
+                "ssh://git@git.4406.madtown.cloud:2222/homelab/observability.git",
+                Path("/Users/clay/Code/homelab/observability"),
+            ),
+        )
+        self.config = SimpleNamespace(repositories=self.repositories)
+
+    def test_unknown_name_is_rejected_before_runner_calls(self) -> None:
+        from homelab_agent.git_command import UsageError as GitUsageError, run_git
+
+        with self.assertRaisesRegex(GitUsageError, "unknown repository"):
+            run_git(["clone", "unknown"], load=lambda: self.config, runner=self.runner)
+
+        self.assertEqual([], self.runner.calls)
+
+    def test_initial_clone_uses_helper_and_sets_local_transport(self) -> None:
+        from homelab_agent.git_command import clone_repository
+
+        repository = self.repositories[0]
+        with patch.object(Path, "exists", return_value=False):
+            clone_repository(repository, runner=self.runner)
+
+        calls = [call.argv for call in self.runner.calls]  # type: ignore[attr-defined]
+        self.assertIn(
+            (
+                "/usr/bin/git",
+                "-c",
+                f"core.sshCommand={self.ssh_command}",
+                "clone",
+                repository.remote,
+                str(repository.path),
+            ),
+            calls,
+        )
+        self.assertIn(
+            (
+                "/usr/bin/git",
+                "-C",
+                str(repository.path),
+                "config",
+                "--local",
+                "core.sshCommand",
+                self.ssh_command,
+            ),
+            calls,
+        )
+        self.assertFalse(any("--global" in call for call in calls))
+
+    def test_existing_non_repository_directory_is_refused(self) -> None:
+        from homelab_agent.git_command import GitError, clone_repository
+
+        repository = self.repositories[0]
+        with patch.object(Path, "exists", return_value=True), patch.object(
+            Path, "is_dir", return_value=True
+        ):
+            with self.assertRaisesRegex(GitError, "not an approved Git worktree"):
+                clone_repository(repository, runner=self.runner)
+
+        self.assertEqual(1, len(self.runner.calls))
+        self.assertEqual(
+            ("/usr/bin/git", "-C", str(repository.path), "rev-parse", "--is-inside-work-tree"),
+            self.runner.calls[0].argv,  # type: ignore[attr-defined]
+        )
+
+    def test_existing_correct_worktree_is_idempotent(self) -> None:
+        from homelab_agent.git_command import clone_repository
+
+        repository = self.repositories[0]
+        self.runner = FakeRunner([completed("true\n"), completed(repository.remote + "/\n")])
+        with patch.object(Path, "exists", return_value=True), patch.object(
+            Path, "is_dir", return_value=True
+        ):
+            clone_repository(repository, runner=self.runner)
+
+        calls = [call.argv for call in self.runner.calls]  # type: ignore[attr-defined]
+        self.assertFalse(any("clone" in call for call in calls))
+        self.assertFalse(any("remote" in call and "set-url" in call for call in calls))
+        self.assertIn(
+            ("/usr/bin/git", "-C", str(repository.path), "config", "--local", "core.sshCommand", self.ssh_command),
+            calls,
+        )
+
+    def test_existing_wrong_origin_is_refused_without_repair(self) -> None:
+        from homelab_agent.git_command import GitError, clone_repository
+
+        repository = self.repositories[0]
+        self.runner = FakeRunner([completed("true\n"), completed("ssh://git@elsewhere:2222/homelab/infra.git\n")])
+        with patch.object(Path, "exists", return_value=True), patch.object(
+            Path, "is_dir", return_value=True
+        ):
+            with self.assertRaisesRegex(GitError, "origin does not match"):
+                clone_repository(repository, runner=self.runner)
+
+        calls = [call.argv for call in self.runner.calls]  # type: ignore[attr-defined]
+        self.assertFalse(any("set-url" in call for call in calls))
+
+    def test_clone_foundation_preserves_declared_order(self) -> None:
+        from homelab_agent.git_command import clone_foundation
+
+        with patch.object(Path, "exists", return_value=False):
+            clone_foundation(load=lambda: self.config, runner=self.runner)
+
+        clone_remotes = [call.argv[4] for call in self.runner.calls if call.argv[3] == "clone"]  # type: ignore[attr-defined]
+        self.assertEqual([repository.remote for repository in self.repositories], clone_remotes)
+
+    def test_fetch_validates_origin_then_uses_local_helper_config(self) -> None:
+        from homelab_agent.git_command import run_git
+
+        repository = self.repositories[0]
+        self.runner = FakeRunner([completed("true\n"), completed(repository.remote + "\n")])
+        with patch.object(Path, "exists", return_value=True), patch.object(
+            Path, "is_dir", return_value=True
+        ):
+            run_git(["fetch", "infra"], load=lambda: self.config, runner=self.runner)
+
+        self.assertEqual(
+            ("/usr/bin/git", "-C", str(repository.path), "fetch"),
+            self.runner.calls[-1].argv,  # type: ignore[attr-defined]
+        )
+
+    def test_configure_refuses_paths_outside_declared_destinations(self) -> None:
+        from homelab_agent.git_command import UsageError as GitUsageError, run_git
+
+        with self.assertRaisesRegex(GitUsageError, "configured repository destination"):
+            run_git(
+                ["configure", "/Users/clay/Code/elsewhere"],
+                load=lambda: self.config,
+                runner=self.runner,
+            )
+
+        self.assertEqual([], self.runner.calls)
+
+    def test_cli_dispatches_git_without_connect_or_keychain(self) -> None:
+        from homelab_agent import cli
+
+        observed: list[tuple[str, ...]] = []
+        rc = cli.main(
+            ["git", "clone", "infra"],
+            git_runner=lambda argv: observed.append(tuple(argv)) or 9,
+        )
+
+        self.assertEqual(9, rc)
+        self.assertEqual([("clone", "infra")], observed)
 
 
 if __name__ == "__main__":
