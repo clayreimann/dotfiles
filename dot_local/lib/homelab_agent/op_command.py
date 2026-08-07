@@ -8,6 +8,7 @@ from collections.abc import Callable, Sequence
 from typing import Any, Mapping, TextIO
 
 from .config import load_config
+from .connect import ConnectClient
 from .keychain import Keychain
 from .process import AgentError, ProcessSpec, Runner, Secret
 from .ssh_session import ConnectRoute
@@ -15,6 +16,21 @@ from .ssh_session import ConnectRoute
 
 _OP_PATH = "/opt/homebrew/bin/op"
 _VAULT_NAME = "Homelab Secrets"
+
+# `op` refuses these subcommands against a Connect server ("doesn't work with
+# Connect" / wrong output format) even though the Connect REST API supports
+# all of them -- see ConnectClient. `vault get` shares the same "op vault get"
+# subcommand as `vault list` (which is rewritten to it), so it fails the same
+# way and is routed the same way. `read` and `item get` are left on the CLI
+# because they work as-is (item get additionally gets --format=json appended
+# below, which Connect requires).
+_REST_ROUTED_PREFIXES = (
+    ("vault", "list"),
+    ("vault", "get"),
+    ("item", "list"),
+    ("item", "create"),
+    ("item", "edit"),
+)
 _LOCAL_OP_ENVIRONMENT = frozenset(
     {
         "OP_ACCOUNT",
@@ -78,7 +94,9 @@ def validate_op_argv(argv: Sequence[str]) -> tuple[str, ...]:
         and not arguments[2].startswith("-")
         and "=" not in arguments[2]
     ):
-        return (*arguments, "--vault", _VAULT_NAME)
+        # Connect only serves item get in JSON output; this changes op's
+        # human-formatted stdout to JSON, which is intended.
+        return (*arguments, "--vault", _VAULT_NAME, "--format", "json")
     if len(arguments) == 2 and arguments[0] == "read":
         if arguments[1].startswith(f"op://{_VAULT_NAME}/"):
             return arguments
@@ -108,18 +126,43 @@ def _op_environment_to_unset(environ: Mapping[str, str]) -> tuple[str, ...]:
     return tuple(sorted(names))
 
 
-def _scoped_vault_list(payload: str) -> str:
-    try:
-        decoded = json.loads(payload)
-    except json.JSONDecodeError:
-        raise AgentError(
-            "vault list did not return exact Homelab Secrets vault metadata"
-        ) from None
-    if not isinstance(decoded, dict) or decoded.get("name") != _VAULT_NAME:
-        raise AgentError(
-            "vault list did not return exact Homelab Secrets vault metadata"
-        )
-    return json.dumps([decoded]) + "\n"
+def _item_payload_with_category(json_input: Secret | None, operation: str) -> dict[str, object]:
+    """Decode the stdin JSON `_json_stdin` already validated and require a category.
+
+    Connect maps `category` to the item's `templateUuid`; without it the API
+    400s. This runs before Keychain/Connect access (same fail-closed spot as
+    `_json_stdin`'s shape check), so a missing category never costs a request.
+    """
+    payload = json.loads(json_input.reveal()) if json_input is not None else {}
+    if not isinstance(payload.get("category"), str) or not payload["category"]:
+        raise _usage(f"{operation} requires a category field in the item JSON")
+    return payload
+
+
+def _run_rest(
+    caller_arguments: tuple[str, ...],
+    client: ConnectClient,
+    item_payload: dict[str, object] | None,
+) -> str:
+    """Serve the op-over-Connect-unsupported commands over the REST API."""
+    if caller_arguments == ("vault", "list"):
+        return json.dumps(client.list_vaults()) + "\n"
+    if caller_arguments == ("vault", "get", _VAULT_NAME):
+        # Object, not array: `vault get` is single-item op-CLI syntax, distinct
+        # from `vault list`'s array shape even though both resolve to the one
+        # approved vault.
+        return json.dumps(client.get_vault()) + "\n"
+    if caller_arguments == ("item", "list"):
+        return json.dumps(client.list_items()) + "\n"
+    if caller_arguments[:2] == ("item", "create"):
+        if item_payload is None:
+            raise AgentError("item create is missing its decoded payload")
+        return json.dumps(client.create_item(item_payload)) + "\n"
+    if caller_arguments[:2] == ("item", "edit"):
+        if item_payload is None:
+            raise AgentError("item edit is missing its decoded payload")
+        return json.dumps(client.update_item(caller_arguments[2], item_payload)) + "\n"
+    raise AgentError("operation is not supported")  # unreachable: gated by _REST_ROUTED_PREFIXES
 
 
 def run_op(
@@ -129,13 +172,20 @@ def run_op(
     keychain_factory: Callable[[], Keychain] = Keychain,
     route_factory: Callable[..., ConnectRoute] = ConnectRoute,
     runner: Runner | None = None,
+    connect_client_factory: Callable[..., ConnectClient] = ConnectClient,
     stdin: TextIO = sys.stdin,
     output: TextIO = sys.stdout,
 ) -> int:
-    """Run an approved `op` command with Connect credentials scoped to its child."""
+    """Run an approved `op`/Connect command with credentials scoped to its call."""
     caller_arguments = tuple(argv)
     arguments = validate_op_argv(caller_arguments)
     json_input = _json_stdin(arguments, stdin)
+    # Decode and validate the item payload here, before Keychain/Connect
+    # access, so a missing category (like malformed stdin JSON above) is
+    # rejected without spending a credential read or a doomed HTTP request.
+    item_payload: dict[str, object] | None = None
+    if caller_arguments[:2] in (("item", "create"), ("item", "edit")):
+        item_payload = _item_payload_with_category(json_input, " ".join(caller_arguments[:2]))
     config = load()
     if config.vault_name != _VAULT_NAME:
         raise _usage("only the Homelab Secrets vault is supported")
@@ -144,8 +194,14 @@ def run_op(
     account = keychain.local_account()
     token = keychain.read(config.connect_keychain_service, account)
     route = route_factory(keychain=keychain, token=token, account=account)
-    command_runner = runner or Runner()
     with route.open(config) as connect_url:
+        if caller_arguments[:2] in _REST_ROUTED_PREFIXES:
+            client = connect_client_factory(connect_url, token, vault_name=_VAULT_NAME)
+            output.write(_run_rest(caller_arguments, client, item_payload))
+            output.flush()
+            return 0
+
+        command_runner = runner or Runner()
         completed = command_runner.run(
             ProcessSpec(
                 argv=(_OP_PATH, *arguments),
@@ -156,11 +212,14 @@ def run_op(
                 },
                 unset_env=_op_environment_to_unset(os.environ),
                 display_name="approved 1Password command",
+                # op's contract is that secret values go to stdout and
+                # diagnostics go to stderr, so forwarding stderr here is safe
+                # -- it's what makes op-over-Connect rejections diagnosable.
+                # The ssh/git/tea call sites keep the strict default because
+                # they don't share that stdout/stderr invariant.
+                forward_stderr=True,
             )
         )
-    if caller_arguments == ("vault", "list"):
-        output.write(_scoped_vault_list(completed.stdout or ""))
-    else:
-        output.write(completed.stdout or "")
+    output.write(completed.stdout or "")
     output.flush()
     return 0

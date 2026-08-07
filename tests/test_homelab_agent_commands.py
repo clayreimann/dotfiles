@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import subprocess
 import sys
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -40,8 +41,17 @@ class FakeKeychain:
         return Secret(TOKEN)
 
 
+# op's contract is that values go to stdout and diagnostics to stderr, and the
+# op call site opts into forwarding stderr. So this fixture stands in for a
+# diagnostic, not a credential -- naming it otherwise would imply we forward
+# secret material, which is exactly the property these tests exist to protect.
+_OP_STDERR = "op diagnostic\n"
+
+
 def completed(stdout: str = "") -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess(("/opt/homebrew/bin/op",), 0, stdout=stdout, stderr="secret")
+    return subprocess.CompletedProcess(
+        ("/opt/homebrew/bin/op",), 0, stdout=stdout, stderr=_OP_STDERR
+    )
 
 
 class FakeRunner:
@@ -63,7 +73,7 @@ class EnvironmentCapturingProcess:
 
     def __call__(self, argv: tuple[str, ...], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         self.calls.append({"argv": argv, **kwargs})
-        return subprocess.CompletedProcess(argv, 0, stdout=self.stdout, stderr="secret")
+        return subprocess.CompletedProcess(argv, 0, stdout=self.stdout, stderr=_OP_STDERR)
 
 
 class FakeRoute:
@@ -74,6 +84,59 @@ class FakeRoute:
     def open(self, config: object):
         self.opened_with.append(config)
         yield "http://approved-connect.example:8080"
+
+
+class FakeConnectClient:
+    """Records REST-routed calls; never touches urllib or a real vault."""
+
+    def __init__(
+        self,
+        *,
+        vault: dict[str, object] | None = None,
+        vaults: list[dict[str, object]] | None = None,
+        items: list[dict[str, object]] | None = None,
+        created: dict[str, object] | None = None,
+        updated: dict[str, object] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.calls: list[tuple[object, ...]] = []
+        self.init_args: list[tuple[object, ...]] = []
+        self._vault = {"id": "vault-id", "name": "Homelab Secrets"} if vault is None else vault
+        self._vaults = [self._vault] if vaults is None else vaults
+        self._items = [] if items is None else items
+        self._created = {"id": "new-item"} if created is None else created
+        self._updated = {"id": "edited-item"} if updated is None else updated
+        self._error = error
+
+    def get_vault(self) -> dict[str, object]:
+        self.calls.append(("get_vault",))
+        if self._error is not None:
+            raise self._error
+        return self._vault
+
+    def list_vaults(self) -> list[dict[str, object]]:
+        self.calls.append(("list_vaults",))
+        if self._error is not None:
+            raise self._error
+        return self._vaults
+
+    def list_items(self) -> list[dict[str, object]]:
+        self.calls.append(("list_items",))
+        if self._error is not None:
+            raise self._error
+        return self._items
+
+    def create_item(self, payload: dict[str, object]) -> dict[str, object]:
+        self.calls.append(("create_item", dict(payload)))
+        if self._error is not None:
+            raise self._error
+        return self._created
+
+    def update_item(self, item_id: str, payload: dict[str, object]) -> dict[str, object]:
+        self.calls.append(("update_item", item_id, dict(payload)))
+        if self._error is not None:
+            raise self._error
+        return self._updated
 
 
 def config() -> SimpleNamespace:
@@ -88,6 +151,7 @@ class OpCommandTests(unittest.TestCase):
         self.keychain = FakeKeychain()
         self.runner = FakeRunner()
         self.route = FakeRoute()
+        self.connect_client = FakeConnectClient()
         self.output = io.StringIO()
 
     def run_command(
@@ -96,6 +160,7 @@ class OpCommandTests(unittest.TestCase):
         stdin: str = "{}",
         *,
         runner: Runner | FakeRunner | None = None,
+        connect_client: object | None = None,
     ) -> int:
         return run_op(
             argv,
@@ -103,6 +168,7 @@ class OpCommandTests(unittest.TestCase):
             keychain_factory=lambda: self.keychain,
             route_factory=lambda **_kwargs: self.route,
             runner=runner or self.runner,
+            connect_client_factory=lambda *_args, **_kwargs: connect_client or self.connect_client,
             stdin=io.StringIO(stdin),
             output=self.output,
         )
@@ -162,16 +228,17 @@ class OpCommandTests(unittest.TestCase):
 
         self.assertEqual([], self.keychain.calls)
 
-    def test_create_forwards_json_only_on_stdin(self) -> None:
-        self.run_command(["item", "create", "-"], '{"title": "Router password"}')
+    def test_create_routes_through_rest_with_the_decoded_payload_and_vault_injected_by_the_client(
+        self,
+    ) -> None:
+        self.run_command(["item", "create", "-"], '{"title": "Router password", "category": "LOGIN"}')
 
-        call = self.runner.calls[-1]
+        self.assertEqual([], self.runner.calls)
         self.assertEqual(
-            ("/opt/homebrew/bin/op", "item", "create", "-", "--vault", "Homelab Secrets"),
-            call.argv,  # type: ignore[attr-defined]
+            [("create_item", {"title": "Router password", "category": "LOGIN"})],
+            self.connect_client.calls,
         )
-        self.assertIsInstance(call.stdin, Secret)  # type: ignore[attr-defined]
-        self.assertEqual('{"title": "Router password"}', call.stdin.reveal())  # type: ignore[attr-defined]
+        self.assertEqual('{"id": "new-item"}\n', self.output.getvalue())
 
     def test_field_deletion_is_rejected_before_keychain_access(self) -> None:
         with self.assertRaisesRegex(UsageError, "field deletion is not supported"):
@@ -206,16 +273,104 @@ class OpCommandTests(unittest.TestCase):
             self.run_command(["item", "edit", EDIT_ITEM_ID], "not json")
         self.assertEqual([], self.keychain.calls)
 
-    def test_edit_forwards_json_only_on_stdin(self) -> None:
-        self.run_command(["item", "edit", EDIT_ITEM_ID], '{"fields": []}')
+    def test_edit_routes_through_rest_with_the_decoded_payload_and_vault_injected_by_the_client(
+        self,
+    ) -> None:
+        self.run_command(["item", "edit", EDIT_ITEM_ID], '{"fields": [], "category": "LOGIN"}')
+
+        self.assertEqual([], self.runner.calls)
+        self.assertEqual(
+            [("update_item", EDIT_ITEM_ID, {"fields": [], "category": "LOGIN"})],
+            self.connect_client.calls,
+        )
+        self.assertEqual('{"id": "edited-item"}\n', self.output.getvalue())
+
+    def test_create_without_a_category_is_rejected_before_any_request(self) -> None:
+        with self.assertRaisesRegex(UsageError, "item create requires a category field"):
+            self.run_command(["item", "create", "-"], '{"title": "Router password"}')
+
+        self.assertEqual([], self.connect_client.calls)
+        self.assertEqual([], self.keychain.calls)
+
+    def test_edit_without_a_category_is_rejected_before_any_request(self) -> None:
+        with self.assertRaisesRegex(UsageError, "item edit requires a category field"):
+            self.run_command(["item", "edit", EDIT_ITEM_ID], '{"fields": []}')
+
+        self.assertEqual([], self.connect_client.calls)
+
+    def test_vault_list_vault_get_item_list_create_and_edit_never_reach_the_op_cli(self) -> None:
+        cases = (
+            (["vault", "list"], "{}"),
+            (["vault", "get", "Homelab Secrets"], "{}"),
+            (["item", "list"], "{}"),
+            (["item", "create", "-"], '{"category": "LOGIN"}'),
+            (["item", "edit", EDIT_ITEM_ID], '{"category": "LOGIN"}'),
+        )
+        for argv, stdin in cases:
+            with self.subTest(argv=argv):
+                self.setUp()
+                self.run_command(list(argv), stdin)
+                self.assertEqual([], self.runner.calls, f"{argv} must not invoke the op CLI")
+
+    def test_vault_get_returns_the_single_vault_as_an_object_not_an_array(self) -> None:
+        self.connect_client = FakeConnectClient(vault={"id": "homelab-id", "name": "Homelab Secrets"})
+
+        self.run_command(["vault", "get", "Homelab Secrets"])
+
+        self.assertEqual(
+            '{"id": "homelab-id", "name": "Homelab Secrets"}\n',
+            self.output.getvalue(),
+        )
+        self.assertEqual([("get_vault",)], self.connect_client.calls)
+
+    def test_vault_get_rejects_any_vault_name_other_than_the_approved_one(self) -> None:
+        for argv in (
+            ["vault", "get", "Personal"],
+            ["vault", "get", "Other vault"],
+            ["vault", "get", ""],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaises(UsageError):
+                    self.run_command(list(argv))
+
+        self.assertEqual([], self.keychain.calls)
+        self.assertEqual([], self.connect_client.calls)
+
+    def test_read_and_item_get_still_go_through_the_op_cli(self) -> None:
+        cases = (
+            ["read", "op://Homelab Secrets/router/password"],
+            ["item", "get", "item-id"],
+        )
+        for argv in cases:
+            with self.subTest(argv=argv):
+                self.setUp()
+                self.run_command(list(argv))
+                self.assertEqual(1, len(self.runner.calls))
+                self.assertEqual([], self.connect_client.calls)
+
+    def test_item_get_gets_format_json_appended_for_the_op_cli_call(self) -> None:
+        self.run_command(["item", "get", "item-id"])
 
         call = self.runner.calls[-1]
         self.assertEqual(
-            ("/opt/homebrew/bin/op", "item", "edit", EDIT_ITEM_ID, "--vault", "Homelab Secrets"),
+            ("/opt/homebrew/bin/op", "item", "get", "item-id", "--vault", "Homelab Secrets", "--format", "json"),
             call.argv,  # type: ignore[attr-defined]
         )
-        self.assertIsInstance(call.stdin, Secret)  # type: ignore[attr-defined]
-        self.assertEqual('{"fields": []}', call.stdin.reveal())  # type: ignore[attr-defined]
+
+    def test_rest_errors_surface_the_http_status_and_api_message(self) -> None:
+        detailed = AgentError(
+            'Connect item create failed: HTTP 400 (Required field "item.templateUuid" not found)'
+        )
+        self.connect_client = FakeConnectClient(error=detailed)
+
+        with self.assertRaisesRegex(AgentError, r"HTTP 400 \(Required field"):
+            self.run_command(["item", "create", "-"], '{"category": "LOGIN"}')
+
+    def test_op_cli_calls_opt_into_stderr_forwarding(self) -> None:
+        self.run_command(["read", "op://Homelab Secrets/router/password"])
+
+        call = self.runner.calls[-1]
+        self.assertTrue(call.forward_stderr)  # type: ignore[attr-defined]
 
     def test_validation_appends_the_only_allowed_vault_to_item_operations(self) -> None:
         self.assertEqual(
@@ -243,10 +398,8 @@ class OpCommandTests(unittest.TestCase):
 
         self.assertEqual([], self.keychain.calls)
 
-    def test_each_read_operation_forwards_successful_child_stdout(self) -> None:
+    def test_each_op_cli_operation_forwards_successful_child_stdout(self) -> None:
         cases = (
-            ["vault", "get", "Homelab Secrets"],
-            ["item", "list"],
             ["item", "get", "item-id"],
             ["read", "op://Homelab Secrets/router/password"],
         )
@@ -261,84 +414,42 @@ class OpCommandTests(unittest.TestCase):
                     keychain_factory=lambda: self.keychain,
                     route_factory=lambda **_kwargs: self.route,
                     runner=runner,
+                    connect_client_factory=lambda *_a, **_k: self.fail(
+                        "op-CLI operations must not build a Connect client"
+                    ),
                     stdin=io.StringIO(),
                     output=output,
                 )
                 self.assertEqual(0, rc)
                 self.assertEqual("allowed child output\n", output.getvalue())
 
-    def test_create_and_edit_forward_successful_child_stdout(self) -> None:
+    def test_each_rest_routed_operation_writes_the_clients_json_result(self) -> None:
         cases = (
-            (["item", "create", "-"], '{"title": "Router"}'),
-            (["item", "edit", EDIT_ITEM_ID], '{"fields": []}'),
+            (["vault", "list"], "{}", [{"id": "vault-id", "name": "Homelab Secrets"}]),
+            (["item", "list"], "{}", []),
         )
 
-        for argv, stdin in cases:
+        for argv, stdin, vaults_or_items in cases:
             with self.subTest(argv=argv):
-                output = io.StringIO()
-                runner = FakeRunner([completed("mutation result\n")])
-                rc = run_op(
-                    argv,
-                    load=config,
-                    keychain_factory=lambda: self.keychain,
-                    route_factory=lambda **_kwargs: self.route,
-                    runner=runner,
-                    stdin=io.StringIO(stdin),
-                    output=output,
-                )
+                self.setUp()
+                self.connect_client = FakeConnectClient(vaults=vaults_or_items, items=vaults_or_items)
+                rc = self.run_command(list(argv), stdin)
                 self.assertEqual(0, rc)
-                self.assertEqual("mutation result\n", output.getvalue())
+                self.assertEqual(json.dumps(vaults_or_items) + "\n", self.output.getvalue())
+                self.assertEqual([], self.runner.calls)
 
-    def test_vault_list_uses_confined_get_and_emits_a_list_shaped_response(self) -> None:
-        self.runner = FakeRunner(
-            [
-                completed(
-                    '{"id":"homelab-id","name":"Homelab Secrets"}'
-                )
-            ]
+    def test_vault_list_output_is_exactly_the_configured_vault_as_a_json_array(self) -> None:
+        self.connect_client = FakeConnectClient(
+            vaults=[{"id": "homelab-id", "name": "Homelab Secrets"}]
         )
 
         self.run_command(["vault", "list"])
 
-        call = self.runner.calls[-1]
-        self.assertEqual(
-            (
-                "/opt/homebrew/bin/op",
-                "vault",
-                "get",
-                "Homelab Secrets",
-                "--format",
-                "json",
-            ),
-            call.argv,  # type: ignore[attr-defined]
-        )
         self.assertEqual(
             '[{"id": "homelab-id", "name": "Homelab Secrets"}]\n',
             self.output.getvalue(),
         )
-
-    def test_vault_list_fails_closed_for_invalid_or_mismatched_metadata(self) -> None:
-        payloads = (
-            "not-json",
-            '[{"id":"homelab-id","name":"Homelab Secrets"}]',
-            '{"id":"personal-id","name":"Personal"}',
-        )
-
-        for payload in payloads:
-            with self.subTest(payload=payload):
-                output = io.StringIO()
-                runner = FakeRunner([completed(payload)])
-                with self.assertRaisesRegex(AgentError, "exact Homelab Secrets vault metadata"):
-                    run_op(
-                        ["vault", "list"],
-                        load=config,
-                        keychain_factory=lambda: self.keychain,
-                        route_factory=lambda **_kwargs: self.route,
-                        runner=runner,
-                        stdin=io.StringIO(),
-                        output=output,
-                    )
-                self.assertEqual("", output.getvalue())
+        self.assertEqual([("list_vaults",)], self.connect_client.calls)
 
     def test_unapproved_operation_flags_are_rejected_before_keychain_access(self) -> None:
         cases = (
@@ -369,7 +480,9 @@ class OpCommandTests(unittest.TestCase):
             "OP_FORMAT": "json",
         }
 
-        with patch.dict(os.environ, inherited, clear=False):
+        # The op call site forwards the child's stderr by design, so capture it
+        # rather than letting the fixture's diagnostic line print mid-suite.
+        with patch.dict(os.environ, inherited, clear=False), redirect_stderr(io.StringIO()):
             self.run_command(["item", "get", "item-id"], runner=Runner(executor))
             self.assertEqual(inherited, {name: os.environ[name] for name in inherited})
 

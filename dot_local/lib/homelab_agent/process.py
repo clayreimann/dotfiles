@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from typing import Callable, Mapping
 
@@ -37,6 +38,12 @@ class ProcessSpec:
     unset_env: tuple[str, ...] = ()
     pass_fds: tuple[int, ...] = ()
     display_name: str = "child process"
+    # Off by default: this process boundary's contract is that child stdout
+    # and stderr never reach our own diagnostics, since most call sites (ssh,
+    # git, tea) have no guarantee stderr is secret-free. Only flip this on for
+    # a call site whose child contract puts secret values on stdout and
+    # diagnostics on stderr -- e.g. op.
+    forward_stderr: bool = False
 
 
 ProcessExecutor = Callable[..., subprocess.CompletedProcess[str]]
@@ -65,6 +72,9 @@ class Runner:
             )
         except Exception:
             raise AgentError(f"{spec.display_name} could not be started") from None
+
+        if spec.forward_stderr and completed.stderr:
+            sys.stderr.write(completed.stderr)
 
         if completed.returncode != 0:
             raise AgentError(
