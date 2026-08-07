@@ -1,2 +1,4 @@
+# Chezmoi ignores source-directory entries beginning with a dot, so this file
+# is invisible to `chezmoi apply` and only affects git.
 __pycache__/
 *.pyc

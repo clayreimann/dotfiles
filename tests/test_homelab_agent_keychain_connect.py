@@ -1,14 +1,17 @@
 """Regression tests for redacted Keychain and 1Password Connect clients."""
 from __future__ import annotations
 
+import io
+import json
 import os
 import subprocess
 import sys
 import unittest
 import uuid
+from contextlib import redirect_stderr
 from pathlib import Path
 from typing import Any
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dot_local" / "lib"))
@@ -37,8 +40,6 @@ class FakeProcess:
 
 class FakeResponse:
     def __init__(self, payload: object) -> None:
-        import json
-
         self.payload = json.dumps(payload).encode("utf-8")
 
     def read(self) -> bytes:
@@ -57,6 +58,9 @@ class RecordedRequest:
         self.url = request.full_url  # type: ignore[attr-defined]
         self.headers = dict(request.header_items())  # type: ignore[attr-defined]
         self.timeout = timeout
+        self.method = request.get_method()  # type: ignore[attr-defined]
+        raw_body = request.data  # type: ignore[attr-defined]
+        self.body = json.loads(raw_body.decode("utf-8")) if raw_body else None
 
 
 class FakeHttp:
@@ -105,6 +109,33 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("test", call["env"]["PUBLIC_MODE"])  # type: ignore[index]
         self.assertNotIn(TOKEN, str(caught.exception))
         self.assertNotIn("sensitive stderr", str(caught.exception))
+
+    def test_runner_does_not_forward_stderr_by_default(self) -> None:
+        """The ssh/git/tea call sites rely on this: no child output leaks out."""
+        fake_process = FakeProcess([completed(("tool",), returncode=0)])
+        captured = io.StringIO()
+
+        with redirect_stderr(captured):
+            Runner(fake_process).run(ProcessSpec(argv=("tool",), display_name="tool"))
+
+        self.assertEqual("", captured.getvalue())
+
+    def test_runner_forwards_stderr_only_when_opted_in(self) -> None:
+        fake_process = FakeProcess(
+            [completed(("tool",), returncode=0), completed(("tool",), returncode=9)]
+        )
+        captured = io.StringIO()
+
+        with redirect_stderr(captured):
+            Runner(fake_process).run(
+                ProcessSpec(argv=("tool",), display_name="tool", forward_stderr=True)
+            )
+            with self.assertRaises(AgentError):
+                Runner(fake_process).run(
+                    ProcessSpec(argv=("tool",), display_name="tool", forward_stderr=True)
+                )
+
+        self.assertEqual("sensitive stderr" * 2, captured.getvalue())
 
     def test_secret_never_formats_its_value(self) -> None:
         secret = Secret(TOKEN)
@@ -374,6 +405,91 @@ class ConnectClientTests(unittest.TestCase):
                     client.health()
 
                 self.assertNotIn(secret_value, str(caught.exception))
+
+    def test_list_vaults_returns_only_the_configured_vault_as_a_single_element_list(self) -> None:
+        fake_http = FakeHttp([vaults()])
+        client = ConnectClient("http://127.0.0.1:18080", Secret(TOKEN), fake_http)
+
+        self.assertEqual(vaults(), client.list_vaults())
+        self.assertEqual("/v1/vaults", fake_http.requests[-1].path)
+        self.assertEqual("GET", fake_http.requests[-1].method)
+
+    def test_list_items_gets_the_configured_vaults_item_collection(self) -> None:
+        items = [{"id": ITEM_ID, "title": "Forgejo agent key"}]
+        fake_http = FakeHttp([vaults(), items])
+        client = ConnectClient("http://127.0.0.1:18080", Secret(TOKEN), fake_http)
+
+        self.assertEqual(items, client.list_items())
+        self.assertEqual("/v1/vaults/vault-id/items", fake_http.requests[-1].path)
+        self.assertEqual("GET", fake_http.requests[-1].method)
+
+    def test_create_item_posts_the_payload_scoped_to_the_configured_vault(self) -> None:
+        created = {"id": ITEM_ID, "category": "LOGIN"}
+        fake_http = FakeHttp([vaults(), created])
+        client = ConnectClient("http://127.0.0.1:18080", Secret(TOKEN), fake_http)
+
+        result = client.create_item({"title": "Router password", "category": "LOGIN"})
+
+        self.assertEqual(created, result)
+        request = fake_http.requests[-1]
+        self.assertEqual("/v1/vaults/vault-id/items", request.path)
+        self.assertEqual("POST", request.method)
+        self.assertEqual(
+            {"title": "Router password", "category": "LOGIN", "vault": {"id": "vault-id"}},
+            request.body,
+        )
+        self.assertEqual("application/json", request.headers["Content-type"])
+
+    def test_update_item_puts_the_payload_scoped_to_the_configured_vault(self) -> None:
+        updated = {"id": ITEM_ID, "category": "LOGIN"}
+        fake_http = FakeHttp([vaults(), updated])
+        client = ConnectClient("http://127.0.0.1:18080", Secret(TOKEN), fake_http)
+
+        result = client.update_item(ITEM_ID, {"fields": [], "category": "LOGIN"})
+
+        self.assertEqual(updated, result)
+        request = fake_http.requests[-1]
+        self.assertEqual(f"/v1/vaults/vault-id/items/{ITEM_ID}", request.path)
+        self.assertEqual("PUT", request.method)
+        self.assertEqual(
+            {"fields": [], "category": "LOGIN", "vault": {"id": "vault-id"}},
+            request.body,
+        )
+
+    def test_create_item_fails_closed_on_a_non_object_response(self) -> None:
+        fake_http = FakeHttp([vaults(), ["not-an-item"]])
+        client = ConnectClient("http://127.0.0.1:18080", Secret(TOKEN), fake_http)
+
+        with self.assertRaisesRegex(AgentError, "invalid item"):
+            client.create_item({"category": "LOGIN"})
+
+    def test_http_error_surfaces_status_and_message_without_leaking_the_token(self) -> None:
+        error = HTTPError(
+            "http://127.0.0.1:18080/v1/vaults/vault-id/items",
+            400,
+            "Bad Request",
+            None,
+            io.BytesIO(json.dumps({"message": 'Required field "item.templateUuid" not found'}).encode()),
+        )
+        fake_http = FakeHttp([vaults(), error])
+        client = ConnectClient("http://127.0.0.1:18080", Secret(TOKEN), fake_http)
+
+        with self.assertRaisesRegex(
+            AgentError, r'Connect item create failed: HTTP 400 \(Required field "item.templateUuid" not found\)'
+        ) as caught:
+            client.create_item({"category": "LOGIN"})
+
+        self.assertNotIn(TOKEN, str(caught.exception))
+
+    def test_http_error_falls_back_to_a_bare_status_when_the_body_has_no_message(self) -> None:
+        error = HTTPError(
+            "http://127.0.0.1:18080/health", 503, "Service Unavailable", None, io.BytesIO(b"not json")
+        )
+        fake_http = FakeHttp([error])
+        client = ConnectClient("http://127.0.0.1:18080", Secret(TOKEN), fake_http)
+
+        with self.assertRaisesRegex(AgentError, r"Connect health check failed: HTTP 503$"):
+            client.health()
 
 
 if __name__ == "__main__":
