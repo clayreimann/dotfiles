@@ -730,7 +730,9 @@ class ConnectRouteTests(unittest.TestCase):
             self.assertIn("-S", argv)
             control_path = Path(argv[argv.index("-S") + 1])
             self.assertEqual(Path(env["SSH_ASKPASS"]).parent, control_path.parent)
-            self.assertEqual(Path("/private/tmp"), control_path.parent.parent)
+            self.assertEqual(
+                Path(ssh_session._short_temp_root()), control_path.parent.parent
+            )
             self.assertLessEqual(len(str(control_path)) + 17, 103)
             self.assertIn("ExitOnForwardFailure=yes", argv)
             self.assertIn("IdentitiesOnly=yes", argv)
