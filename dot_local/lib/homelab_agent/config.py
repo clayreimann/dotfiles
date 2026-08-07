@@ -59,7 +59,7 @@ _APPROVED_FORGEJO_AUTOMATION = {
     "deploy_ref": "main",
     "deploy_targets": ("docker01", "monitor01"),
 }
-_APPROVED_TEA_VERSION = "0.14"
+_APPROVED_TEA_VERSION = "0.15"
 _FORBIDDEN_SECRET_KEYS = frozenset({"token", "password", "passphrase", "private_key"})
 _LEGACY_DOCUMENT_KEYS = frozenset(
     {

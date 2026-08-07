@@ -85,7 +85,7 @@ def valid_document() -> dict[str, object]:
             "tofu": "1",
             "ansible": "2",
             "tailscale": "1",
-            "tea": "0.14",
+            "tea": "0.15",
         },
     }
 
@@ -127,7 +127,7 @@ class LoadConfigTests(unittest.TestCase):
         self.assertEqual("infra-stacks-deploy.yml", config.forgejo_automation.deploy_workflow)
         self.assertEqual("main", config.forgejo_automation.deploy_ref)
         self.assertEqual(("docker01", "monitor01"), config.forgejo_automation.deploy_targets)
-        self.assertEqual("0.14", config.tools["tea"])
+        self.assertEqual("0.15", config.tools["tea"])
         self.assertEqual("docker01", config.target("docker01").alias)
         self.assertEqual(Path("/Users/clay/Code/homelab/infra"), config.repositories[0].path)
 

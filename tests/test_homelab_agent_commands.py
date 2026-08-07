@@ -881,7 +881,7 @@ class DoctorAndEnrollmentTests(unittest.TestCase):
                 "tofu": "1",
                 "ansible": "2",
                 "tailscale": "1",
-                "tea": "0.14",
+                "tea": "0.15",
             },
             vault_name="Homelab Secrets",
             connect_keychain_service="connect-service",
