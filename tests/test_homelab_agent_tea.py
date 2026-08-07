@@ -58,9 +58,10 @@ def completed(
     return subprocess.CompletedProcess((TEA,), returncode, stdout=stdout, stderr=stderr)
 
 
-def config(api_user: str = "claude") -> SimpleNamespace:
+def config(api_user: str = "claude", tea: str = "0.14") -> SimpleNamespace:
     return SimpleNamespace(
         version=2,
+        tools={"tea": tea},
         forgejo=SimpleNamespace(
             api_url="https://git.4406.madtown.cloud",
             api_user=api_user,
@@ -84,7 +85,7 @@ class TeaSessionTests(unittest.TestCase):
         error_output = io.StringIO()
         result = run_tea(
             arguments,
-            load=config,
+            load=kwargs.pop("load", config),
             client=client,
             executor=executor,
             environ=kwargs.pop("environ", {"KEEP": "value"}),
@@ -158,6 +159,7 @@ class TeaSessionTests(unittest.TestCase):
                 completed(),
             ],
             ["issues", "list"],
+            load=lambda: config(tea="0.15"),
         )
 
         self.assertEqual(0, result)
@@ -180,6 +182,128 @@ class TeaSessionTests(unittest.TestCase):
             run_tea(
                 ["issues", "list"],
                 load=config,
+                client=client,
+                executor=executor,
+                environ={},
+                output=io.StringIO(),
+                error_output=io.StringIO(),
+            )
+
+        self.assertEqual([], client.calls)
+        self.assertEqual(1, len(executor.calls))
+
+    def test_accepts_an_installed_patch_version_within_the_declared_minor_series(self) -> None:
+        result, _executor, _client, _output, _error_output = self.run_tea(
+            [
+                completed(stdout="Version: 0.15.1\n"),
+                completed(),
+                completed(stdout='{"login":"claude"}'),
+                completed(),
+            ],
+            ["issues", "list"],
+            load=lambda: config(tea="0.15"),
+        )
+
+        self.assertEqual(0, result)
+
+    def test_rejects_an_installed_version_outside_the_declared_minor_series(self) -> None:
+        try:
+            from homelab_agent.process import AgentError
+            from homelab_agent.tea_session import run_tea
+        except ModuleNotFoundError:
+            self.fail("Tea credential adapter is not implemented")
+        executor = RecordingExecutor([completed(stdout="Version: 0.16.0\n")])
+        client = FakeConnectClient()
+
+        with self.assertRaisesRegex(
+            AgentError, "Tea version must match the approved 0.15 series"
+        ):
+            run_tea(
+                ["issues", "list"],
+                load=lambda: config(tea="0.15"),
+                client=client,
+                executor=executor,
+                environ={},
+                output=io.StringIO(),
+                error_output=io.StringIO(),
+            )
+
+        self.assertEqual([], client.calls)
+        self.assertEqual(1, len(executor.calls))
+
+    def test_rejects_an_installed_version_that_clears_the_floor_but_not_the_declared_series(
+        self,
+    ) -> None:
+        """0.14.9 clears the absolute _MINIMUM_VERSION floor but is not the
+        0.15 series the credential map declares, so the series check must
+        still reject it: the floor alone is not sufficient enforcement.
+        """
+        try:
+            from homelab_agent.process import AgentError
+            from homelab_agent.tea_session import run_tea
+        except ModuleNotFoundError:
+            self.fail("Tea credential adapter is not implemented")
+        executor = RecordingExecutor([completed(stdout="Version: 0.14.9\n")])
+        client = FakeConnectClient()
+
+        with self.assertRaisesRegex(
+            AgentError, "Tea version must match the approved 0.15 series"
+        ):
+            run_tea(
+                ["issues", "list"],
+                load=lambda: config(tea="0.15"),
+                client=client,
+                executor=executor,
+                environ={},
+                output=io.StringIO(),
+                error_output=io.StringIO(),
+            )
+
+        self.assertEqual([], client.calls)
+        self.assertEqual(1, len(executor.calls))
+
+    def test_declared_full_patch_version_requires_an_exact_installed_match(self) -> None:
+        try:
+            from homelab_agent.process import AgentError
+            from homelab_agent.tea_session import run_tea
+        except ModuleNotFoundError:
+            self.fail("Tea credential adapter is not implemented")
+        executor = RecordingExecutor([completed(stdout="Version: 0.15.2\n")])
+        client = FakeConnectClient()
+
+        with self.assertRaisesRegex(
+            AgentError, "Tea version must match the approved 0.15.1 series"
+        ):
+            run_tea(
+                ["issues", "list"],
+                load=lambda: config(tea="0.15.1"),
+                client=client,
+                executor=executor,
+                environ={},
+                output=io.StringIO(),
+                error_output=io.StringIO(),
+            )
+
+        self.assertEqual([], client.calls)
+        self.assertEqual(1, len(executor.calls))
+
+    def test_rejects_a_non_numeric_declared_tea_version_instead_of_skipping_the_check(
+        self,
+    ) -> None:
+        try:
+            from homelab_agent.process import AgentError
+            from homelab_agent.tea_session import run_tea
+        except ModuleNotFoundError:
+            self.fail("Tea credential adapter is not implemented")
+        executor = RecordingExecutor([completed(stdout="Version: 0.15.1\n")])
+        client = FakeConnectClient()
+
+        with self.assertRaisesRegex(
+            AgentError, "approved Tea version in the credential map is invalid"
+        ):
+            run_tea(
+                ["issues", "list"],
+                load=lambda: config(tea="latest"),
                 client=client,
                 executor=executor,
                 environ={},
@@ -231,6 +355,7 @@ class TeaSessionTests(unittest.TestCase):
                     completed(),
                 ],
                 ["issues", "list"],
+                load=lambda: config(tea="0.15"),
             )
         except Exception as error:
             self.fail(f"valid Tea version rejected: {error}")
@@ -297,6 +422,7 @@ class TeaSessionTests(unittest.TestCase):
         session = TeaSession(
             config(api_user="attacker").forgejo,
             FakeConnectClient(),
+            declared_tea_version="0.14",
             executor=executor,
             environ={},
         )
@@ -318,7 +444,13 @@ class TeaSessionTests(unittest.TestCase):
                 completed(stdout='{"workflow_runs":[]}'),
             ]
         )
-        session = TeaSession(config().forgejo, FakeConnectClient(), executor=executor, environ={})
+        session = TeaSession(
+            config().forgejo,
+            FakeConnectClient(),
+            declared_tea_version="0.14",
+            executor=executor,
+            environ={},
+        )
         with session:
             try:
                 response = session.api_json(["/repos/homelab/infra/actions/runs"])
@@ -341,7 +473,13 @@ class TeaSessionTests(unittest.TestCase):
                 completed(stdout='{"id":82}'),
             ]
         )
-        session = TeaSession(config().forgejo, FakeConnectClient(), executor=executor, environ={})
+        session = TeaSession(
+            config().forgejo,
+            FakeConnectClient(),
+            declared_tea_version="0.14",
+            executor=executor,
+            environ={},
+        )
         with session:
             response = session.api_json(
                 ["/repos/homelab/infra/actions/workflows/infra-stacks-deploy.yml/dispatches", "--method", "POST", "--data", "@-"],
@@ -389,7 +527,9 @@ class TeaSessionTests(unittest.TestCase):
         from homelab_agent.process import AgentError
         from homelab_agent.tea_session import TeaSession
 
-        session = TeaSession(config().forgejo, FakeConnectClient(), environ={})
+        session = TeaSession(
+            config().forgejo, FakeConnectClient(), declared_tea_version="0.14", environ={}
+        )
         with patch(
             "homelab_agent.tea_session.tempfile.TemporaryDirectory",
             side_effect=OSError(TOKEN),
