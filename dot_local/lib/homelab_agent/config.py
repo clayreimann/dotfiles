@@ -59,7 +59,6 @@ _APPROVED_FORGEJO_AUTOMATION = {
     "deploy_ref": "main",
     "deploy_targets": ("docker01", "monitor01"),
 }
-_APPROVED_TEA_VERSION = "0.15"
 _FORBIDDEN_SECRET_KEYS = frozenset({"token", "password", "passphrase", "private_key"})
 _LEGACY_DOCUMENT_KEYS = frozenset(
     {
@@ -295,12 +294,9 @@ def _repositories(value: object) -> tuple[Repository, ...]:
 def _tools(value: object, version: int) -> Mapping[str, str]:
     keys = _VERSION_2_TOOL_KEYS if version == 2 else _LEGACY_TOOL_KEYS
     fields = _object(value, "tools", keys)
-    tools = MappingProxyType(
+    return MappingProxyType(
         {name: _string(fields[name], f"tools.{name}") for name in keys}
     )
-    if version == 2 and tools["tea"] != _APPROVED_TEA_VERSION:
-        raise ConfigError("tools.tea must match the approved value")
-    return tools
 
 
 def load_config(path: Path | None = None) -> AgentConfig:

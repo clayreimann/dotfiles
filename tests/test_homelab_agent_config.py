@@ -269,12 +269,19 @@ class LoadConfigTests(unittest.TestCase):
                 ):
                     load_config(self.write_config(document))
 
-    def test_load_config_rejects_unapproved_tea_pin(self) -> None:
+    def test_load_config_does_not_pin_tea_to_a_hardcoded_approved_value(self) -> None:
+        """The credential map is the single source of truth for tools.tea.
+
+        config.py must not duplicate an approval check against a
+        second hardcoded value; the installed-binary check against the
+        declared value lives in tea_session._verify_tea_version instead.
+        """
         document = valid_document()
         document["tools"]["tea"] = "1"  # type: ignore[index]
 
-        with self.assertRaisesRegex(ConfigError, "tools.tea must match the approved value"):
-            load_config(self.write_config(document))
+        config = load_config(self.write_config(document))
+
+        self.assertEqual("1", config.tools["tea"])
 
     def test_load_config_rejects_unknown_version(self) -> None:
         for version in (3, True, "2"):

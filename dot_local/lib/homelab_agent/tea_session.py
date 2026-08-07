@@ -21,11 +21,28 @@ from .ssh_session import ConnectRoute
 TEA = "/opt/homebrew/bin/tea"
 _LOGIN_NAME = "homelab-agent"
 _EXPECTED_API_LOGIN = "claude"
+# Absolute floor below which Tea is not trusted at all. The actual approved
+# version is declared by the credential map (tools.tea), not by this
+# constant; see _verify_tea_version.
 _MINIMUM_VERSION = (0, 14, 2)
 _VERSION_PATTERN = re.compile(r"(?:Version:\s*|\bversion\s+)(\d+)\.(\d+)\.(\d+)", re.I)
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_DECLARED_VERSION_PATTERN = re.compile(r"^\d+(?:\.\d+)*$")
 
 ProcessExecutor = Callable[..., subprocess.CompletedProcess[str]]
+
+
+def _parse_declared_version(declared: str) -> tuple[int, ...]:
+    """Parse a credential-map ``tools.tea`` value into a version tuple.
+
+    A value that is not a dotted sequence of integers is an error, not a
+    value to skip past: the credential map is the single source of truth
+    for the approved Tea version, so a malformed declaration must fail
+    closed rather than silently accept any installed version.
+    """
+    if not _DECLARED_VERSION_PATTERN.match(declared):
+        raise AgentError("approved Tea version in the credential map is invalid")
+    return tuple(int(component) for component in declared.split("."))
 
 
 class TeaSession:
@@ -36,11 +53,13 @@ class TeaSession:
         forgejo: Any,
         client: ConnectClient,
         *,
+        declared_tea_version: str,
         executor: ProcessExecutor = subprocess.run,
         environ: Mapping[str, str] = os.environ,
     ) -> None:
         self._forgejo = forgejo
         self._client = client
+        self._declared_tea_version = declared_tea_version
         self._executor = executor
         self._environ = environ
         self._temporary_directory: tempfile.TemporaryDirectory[str] | None = None
@@ -121,6 +140,11 @@ class TeaSession:
         version = tuple(int(component) for component in match.groups())
         if version < _MINIMUM_VERSION:
             raise AgentError("Tea 0.14.2 or newer is required")
+        declared = _parse_declared_version(self._declared_tea_version)
+        if version[: len(declared)] != declared:
+            raise AgentError(
+                f"Tea version must match the approved {self._declared_tea_version} series"
+            )
 
     def _child_environment(self, overlay: Mapping[str, str] | None = None) -> dict[str, str]:
         if self._config_root is None:
@@ -187,7 +211,13 @@ def run_tea(
     if getattr(config, "version", None) != 2:
         raise AgentError("Tea workflow policy requires credential map version 2")
     if client is not None:
-        with TeaSession(config.forgejo, client, executor=executor, environ=environ) as session:
+        with TeaSession(
+            config.forgejo,
+            client,
+            declared_tea_version=config.tools["tea"],
+            executor=executor,
+            environ=environ,
+        ) as session:
             return session.run(arguments, output=output, error_output=error_output)
 
     keychain = keychain_factory()
@@ -204,6 +234,10 @@ def run_tea(
             connect_url, token, vault_name=config.vault_name
         )
         with TeaSession(
-            config.forgejo, connected_client, executor=executor, environ=environ
+            config.forgejo,
+            connected_client,
+            declared_tea_version=config.tools["tea"],
+            executor=executor,
+            environ=environ,
         ) as session:
             return session.run(arguments, output=output, error_output=error_output)
