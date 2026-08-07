@@ -1,3 +1,8 @@
+# Machine-local hosts, not committed. Must precede `Host *` — OpenSSH takes
+# the first obtained value for each option, so an include placed later could
+# not override anything. A missing file is silently skipped.
+Include ~/.ssh/config.local
+
 Host *
   AddKeysToAgent yes
   UseKeychain yes

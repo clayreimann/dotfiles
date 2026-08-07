@@ -1,0 +1,17 @@
+# Paths chezmoi must not manage. Patterns are relative to the destination
+# directory (the home directory), not to this source repo.
+
+# Repo-only content. Without these, a bare `chezmoi apply` creates ~/docs,
+# ~/scripts, ~/tests and ~/.superpowers from directories that exist for the
+# repository's own sake and are not dotfiles.
+docs
+scripts
+tests
+.superpowers
+
+# Machine-local SSH hosts. dot_ssh/config includes this file if present;
+# OpenSSH silently skips a missing Include, so the managed config works on a
+# machine that has no local additions. Keeping these entries out of the repo
+# means internal hostnames, addresses, and key filenames are not committed,
+# while a `chezmoi apply` cannot wipe them.
+.ssh/config.local
