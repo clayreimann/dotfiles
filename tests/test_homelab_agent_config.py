@@ -226,7 +226,6 @@ class LoadConfigTests(unittest.TestCase):
             "user": "other-git",
             "credential_item_id": "aaaaaaaaaaaaaaaaaaaaaaaaaa",
             "private_field": "ssh_key",
-            "expected_fingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             "known_host": "[git.4406.madtown.cloud]:2222 ssh-ed25519 AAAA",
             "api_url": "https://other.example",
             "api_user": "other-user",

@@ -31,7 +31,6 @@ _APPROVED_FORGEJO = {
     "user": "git",
     "credential_item_id": "yznfzgoql7jl4oa6spa7vm3644",
     "private_field": "private_key",
-    "expected_fingerprint": "SHA256:hK4mZs4YQvDEf1zgeAOKtER0+eIdPJsDxRzPHlpXpjA",
     "known_host": "[git.4406.madtown.cloud]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGyB56wKbde2dOT+puZOfjpWqTNx3sIDkEjoN1wvUTyT",
     "api_url": "https://git.4406.madtown.cloud",
     "api_user": "claude",
@@ -43,7 +42,6 @@ _APPROVED_FORGEJO_SSH = {
     "user": "git",
     "credential_item_id": "yznfzgoql7jl4oa6spa7vm3644",
     "private_field": "private_key",
-    "expected_fingerprint": "SHA256:hK4mZs4YQvDEf1zgeAOKtER0+eIdPJsDxRzPHlpXpjA",
     "known_host": "[git.4406.madtown.cloud]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGyB56wKbde2dOT+puZOfjpWqTNx3sIDkEjoN1wvUTyT",
 }
 _APPROVED_FORGEJO_AUTOMATION = {
@@ -81,10 +79,12 @@ _IDENTITY_KEYS = frozenset(
         "user",
         "credential_item_id",
         "private_field",
-        "expected_fingerprint",
         "known_host",
     }
 )
+# Accepted and ignored so credential maps predating the client-key pin removal
+# still parse.
+_IGNORED_IDENTITY_KEYS = frozenset({"expected_fingerprint"})
 _FORGEJO_KEYS = _IDENTITY_KEYS | frozenset({"api_url", "api_user", "api_token_field"})
 _FORGEJO_AUTOMATION_KEYS = frozenset(
     {"repository", "required_workflows", "deploy_workflow", "deploy_ref", "deploy_targets"}
@@ -127,11 +127,13 @@ def _reject_secret_keys(value: object, path: str = "") -> None:
             _reject_secret_keys(child, f"{path}.{index}" if path else str(index))
 
 
-def _object(value: object, path: str, keys: frozenset[str]) -> Mapping[str, Any]:
+def _object(
+    value: object, path: str, keys: frozenset[str], ignored: frozenset[str] = frozenset()
+) -> Mapping[str, Any]:
     if not isinstance(value, dict):
         raise ConfigError(f"{path} must be an object")
     actual = set(value)
-    unknown = sorted(actual - keys)
+    unknown = sorted(actual - keys - ignored)
     missing = sorted(keys - actual)
     if unknown:
         raise ConfigError(f"unknown keys at {path}: {', '.join(unknown)}")
@@ -153,29 +155,25 @@ def _port(value: object, path: str) -> int:
 
 
 def _identity(value: object, path: str) -> SshIdentity:
-    fields = _object(value, path, _IDENTITY_KEYS)
+    fields = _object(value, path, _IDENTITY_KEYS, ignored=_IGNORED_IDENTITY_KEYS)
     return SshIdentity(
         host=_string(fields["host"], f"{path}.host"),
         port=_port(fields["port"], f"{path}.port"),
         user=_string(fields["user"], f"{path}.user"),
         credential_item_id=_string(fields["credential_item_id"], f"{path}.credential_item_id"),
         private_field=_string(fields["private_field"], f"{path}.private_field"),
-        expected_fingerprint=_string(fields["expected_fingerprint"], f"{path}.expected_fingerprint"),
         known_host=_string(fields["known_host"], f"{path}.known_host"),
     )
 
 
 def _forgejo_identity(value: object) -> ForgejoIdentity:
-    fields = _object(value, "forgejo", _FORGEJO_KEYS)
+    fields = _object(value, "forgejo", _FORGEJO_KEYS, ignored=_IGNORED_IDENTITY_KEYS)
     return ForgejoIdentity(
         host=_string(fields["host"], "forgejo.host"),
         port=_port(fields["port"], "forgejo.port"),
         user=_string(fields["user"], "forgejo.user"),
         credential_item_id=_string(fields["credential_item_id"], "forgejo.credential_item_id"),
         private_field=_string(fields["private_field"], "forgejo.private_field"),
-        expected_fingerprint=_string(
-            fields["expected_fingerprint"], "forgejo.expected_fingerprint"
-        ),
         known_host=_string(fields["known_host"], "forgejo.known_host"),
         api_url=_string(fields["api_url"], "forgejo.api_url"),
         api_user=_string(fields["api_user"], "forgejo.api_user"),
@@ -222,7 +220,7 @@ def _forgejo_automation(value: object) -> ForgejoAutomation:
 
 
 def _target(value: object, path: str) -> ManagedTarget:
-    fields = _object(value, path, _TARGET_KEYS)
+    fields = _object(value, path, _TARGET_KEYS, ignored=_IGNORED_IDENTITY_KEYS)
     route = _string(fields["route"], f"{path}.route")
     if route not in {"direct", "bastion"}:
         raise ConfigError(f"{path}.route must be direct or bastion")
@@ -234,9 +232,6 @@ def _target(value: object, path: str) -> ManagedTarget:
             fields["credential_item_id"], f"{path}.credential_item_id"
         ),
         private_field=_string(fields["private_field"], f"{path}.private_field"),
-        expected_fingerprint=_string(
-            fields["expected_fingerprint"], f"{path}.expected_fingerprint"
-        ),
         known_host=_string(fields["known_host"], f"{path}.known_host"),
         alias=_string(fields["alias"], f"{path}.alias"),
         route=route,
