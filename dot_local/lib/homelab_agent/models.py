@@ -13,7 +13,6 @@ class SshIdentity:
     user: str
     credential_item_id: str
     private_field: str
-    expected_fingerprint: str
     known_host: str
 
 

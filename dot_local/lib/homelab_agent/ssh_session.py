@@ -103,10 +103,8 @@ class EphemeralAgent:
         self._runner = runner or Runner()
 
     @contextmanager
-    def identity(
-        self, item_id: str, field: str, expected_fingerprint: str
-    ) -> Iterator[AgentSocket]:
-        """Yield a verified one-key agent and terminate it on every exit path."""
+    def identity(self, item_id: str, field: str) -> Iterator[AgentSocket]:
+        """Yield a one-key agent and terminate it on every exit path."""
         started = self._runner.run(
             ProcessSpec(
                 argv=("/usr/bin/ssh-agent", "-s"),
@@ -143,18 +141,7 @@ class EphemeralAgent:
                     display_name="temporary SSH public-key listing",
                 )
             )
-            public_key = _one_public_key(listed.stdout)
-            fingerprint = self._runner.run(
-                ProcessSpec(
-                    argv=("/usr/bin/ssh-keygen", "-lf", "-", "-E", "sha256"),
-                    stdin=public_key,
-                    env_overlay=agent_environment,
-                    unset_env=_AGENT_ENVIRONMENT_NAMES,
-                    display_name="temporary SSH key verification",
-                )
-            )
-            if _fingerprint(fingerprint.stdout) != expected_fingerprint:
-                raise AgentError("loaded SSH key fingerprint does not match expected fingerprint")
+            _one_public_key(listed.stdout)
             yield socket
         finally:
             ssh_add_input = None
@@ -207,16 +194,6 @@ def _one_public_key(output: str) -> str:
     if len(keys) != 1:
         raise AgentError("temporary SSH agent must contain exactly one public key")
     return keys[0]
-
-
-def _fingerprint(output: str) -> str:
-    lines = [line for line in output.splitlines() if line.strip()]
-    if len(lines) != 1:
-        raise AgentError("temporary SSH key verification returned invalid output")
-    fields = lines[0].split()
-    if len(fields) < 2 or not fields[1].startswith("SHA256:"):
-        raise AgentError("temporary SSH key verification returned invalid output")
-    return fields[1]
 
 
 def _validate_destination(identity: SshIdentity, remote_args: Sequence[str]) -> tuple[str, ...]:
@@ -351,7 +328,6 @@ def run_pinned_ssh(
         with agent.identity(
             identity.credential_item_id,
             identity.private_field,
-            identity.expected_fingerprint,
         ) as socket:
             argv = (
                 "/usr/bin/ssh",
@@ -746,7 +722,6 @@ def _run_target_connection(
         with agent.identity(
             target.credential_item_id,
             target.private_field,
-            target.expected_fingerprint,
         ) as agent_socket:
             alias_options: tuple[str, ...] = ()
             if host_key_alias is not None:

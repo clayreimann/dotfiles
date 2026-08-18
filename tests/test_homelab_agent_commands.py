@@ -894,7 +894,6 @@ class DoctorAndEnrollmentTests(unittest.TestCase):
                 user="git",
                 credential_item_id="item-id",
                 private_field="private_key",
-                expected_fingerprint="SHA256:expected",
                 known_host="[git.example]:2222 ssh-ed25519 AAAAPinned",
             ),
             bastion=None,

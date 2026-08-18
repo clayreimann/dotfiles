@@ -121,12 +121,11 @@ def _connect_scope_is_available(client: ConnectClient, identity: Any) -> bool:
 
 
 def _validate_credential(client: ConnectClient, identity: Any) -> bool:
-    """Use the existing ephemeral-agent fingerprint validation without persistent keys."""
+    """Load the key into an ephemeral agent without persisting it."""
     try:
         with EphemeralAgent(client).identity(
             identity.credential_item_id,
             identity.private_field,
-            identity.expected_fingerprint,
         ):
             return True
     except AgentError:
